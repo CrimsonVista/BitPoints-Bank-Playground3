@@ -1,3 +1,14 @@
+# Bank-specific files
+venv/*
+certs/*
+test_bankcore_db/*
+.idea/*
+bank.zip
+bank_receipt.*
+bitpoints.*
+mint2
+pwds
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
