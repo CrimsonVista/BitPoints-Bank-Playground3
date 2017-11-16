@@ -4,8 +4,9 @@ Created on Feb 16, 2016
 @author: sethjn
 '''
 
-import os, threading, sys, textwrap, traceback, shlex
+import os, threading, sys, textwrap, traceback, shlex, time
 import asyncio
+from AsyncIODeferred import Deferred
 from playground.network.common.Protocol import StackingProtocol
 
 class AdvancedStdio(object):
@@ -20,7 +21,7 @@ class AdvancedStdio(object):
                 AdvancedStdio.ReadlineModule = readline
             except ImportError as e:
                 print("Could not find module readline. If you're on Windows, make sure you pip install pyreadline")
-                print(e)
+                debugPrint(e)
                 sys.exit(1)
         self.__protocol = protocol
         self.__getLine = False
@@ -77,11 +78,15 @@ class AdvancedStdio(object):
                 self.__getLineCV.wait(1.0)
 
     def __protocolProcessLine(self, line):
-        result, d = self.__protocol.line_received(line)
-        if d:
-            d.add_done_callback(lambda res: self.getNextInput())
-        else:
-            self.getNextInput()
+        try:
+            result, d = self.__protocol.line_received(line)
+            if d:
+                d.addCallback(lambda res: self.getNextInput())
+                d.addErrback(lambda res: self.getNextInput())
+            else:
+                self.getNextInput()
+        except:
+            print(traceback.format_exc())
 
     def loop(self):
         readline = self.ReadlineModule
@@ -155,18 +160,17 @@ class TwistedStdioReplacement(object):
     StandardIO = AdvancedStdio
     formatText = formatText
 
+class ArgPod(object):
+    def __init__(self):
+        self.argHandler = lambda writer, *args: args
+        self.cmdHandler = None
+        self.help = None
+        self.usage = None
 
 class CLICommand(CompleterInterface):
     SINGLETON_MODE = "Singletone Mode: Single callback no matter the args"
     STANDARD_MODE = "Standard Mode: Arguments Only"
     SUBCMD_MODE = "SubCommand Mode: Requires a sub command"
-
-    class ArgPod(object):
-        def __init__(self):
-            self.argHandler = lambda writer, *args: args
-            self.cmdHandler = None
-            self.help = None
-            self.usage = None
 
     def __init__(self, cmdTxt, helpTxt, defaultCb = None, defaultArgHandler = None, mode=SINGLETON_MODE):
         self.cmdTxt = cmdTxt
@@ -240,54 +244,69 @@ class CLICommand(CompleterInterface):
             raise Exception("CLI command %s already configured for %d args" % (self.cmdTxt, numArgs))
         if numArgs < 1:
             raise Exception("CLI command cannot take a negative number of arguments")
-        self.cb[numArgs] = self.ArgPod()
-        self.cb[numArgs].cmdHandler = cmdHandler
-        self.cb[numArgs].helpTxt = helpTxt
-        self.cb[numArgs].usage = usage
+        try:
+            self.cb[numArgs] = ArgPod()
+            self.cb[numArgs].cmdHandler = cmdHandler
+            self.cb[numArgs].helpTxt = helpTxt
+            self.cb[numArgs].usage = usage
+        except:
+            print(traceback.format_exc())
         if argHandler: self.cb[numArgs].argHandler = argHandler
 
     def process(self, args, writer):
-        if self.__mode == CLICommand.SINGLETON_MODE:
-            args = map(self.stripCompleterKeys, args)
-            args = self.__defaultArgHandler(writer, *args)
-            if args is None:
-                writer("Command failed.\n")
-                return (False, None)
-            else:
-                d = self.__defaultCb(writer, *args)
-                return (True, d)
-        if len(args)==0:
-            if not self.__defaultCb:
-                writer("Command requires arguments\n")
-            else:
+        try:
+            if self.__mode == CLICommand.SINGLETON_MODE:
+                args = map(self.stripCompleterKeys, args)
                 args = self.__defaultArgHandler(writer, *args)
                 if args is None:
                     writer("Command failed.\n")
                     return (False, None)
                 else:
+                    debugPrint("CLICmd process 1")
                     d = self.__defaultCb(writer, *args)
                     return (True, d)
-        if self.__mode == CLICommand.SUBCMD_MODE:
-            subCmd = args[0]
-            subCmdArgs = args[1:]
-            subCmdHandler = self.cb.get(subCmd, None)
-            if not subCmdHandler:
-                writer("No such command %s\n" % subCmd)
-                return (False, None)
-            return subCmdHandler.process(subCmdArgs, writer)
-        else:
-            args = list(map(self.stripCompleterKeys, args))
-            argsPod = self.cb.get(len(args), None)
-            if not argsPod:
-                writer("Wrong number of arguments\n")
-                return (False, None)
-            args = argsPod.argHandler(writer, *args)
-            if args is None:
-                writer("Command failed\n")
-                return (False, None)
+            if len(args)==0:
+                if not self.__defaultCb:
+                    writer("Command requires arguments\n")
+                else:
+                    args = self.__defaultArgHandler(writer, *args)
+                    if args is None:
+                        writer("Command failed.\n")
+                        return (False, None)
+                    else:
+                        debugPrint("CLICmd process 2")
+                        d = self.__defaultCb(writer, *args)
+                        return (True, d)
+            if self.__mode == CLICommand.SUBCMD_MODE:
+                subCmd = args[0]
+                subCmdArgs = args[1:]
+                subCmdHandler = self.cb.get(subCmd, None)
+                if not subCmdHandler:
+                    writer("No such command %s\n" % subCmd)
+                    return (False, None)
+
+                debugPrint("CLICmd process calling subCmdHandler.process")
+                return subCmdHandler.process(subCmdArgs, writer)
             else:
-                d = argsPod.cmdHandler(writer, *args)
-                return (True, d)
+                args = list(map(self.stripCompleterKeys, args))
+                argsPod = self.cb.get(len(args), None)
+                debugPrint("CLICmd process self.cb:", self.cb)
+                if not argsPod:
+                    writer("Wrong number of arguments\n")
+                    return (False, None)
+                args = argsPod.argHandler(writer, *args)
+                debugPrint("CLICmd process self.cb args:", args)
+                if args is None:
+                    writer("Command failed\n")
+                    return (False, None)
+                else:
+                    debugPrint("CLICmd process 3 argsPod:", argsPod)
+                    debugPrint("argspod.cmdHandler", argsPod.cmdHandler)
+                    d = argsPod.cmdHandler(writer, *args)
+                    debugPrint("CLICmd process 3 DONE!")
+                    return (True, d)
+        except:
+            print(traceback.format_exc())
 
     def complete(self, s, state):
         if self.__mode == CLICommand.SUBCMD_MODE:
@@ -368,6 +387,7 @@ class LineReceiver(StackingProtocol):
                             self._buffer = b''
                             return self.lineLengthExceeded(exceeded)
                         why = self.line_received(line)
+                        debugPrint("LR data_received why:", why)
                         if (why or self.transport and
                             self.transport.disconnecting):
                             return why
@@ -487,28 +507,29 @@ class CLIShell(LineReceiver, CompleterInterface):
             line = batchLines.pop(0)
             writer("[Batch] > %s\n" % line)
             result, d = self.line_received(line)
-            print(result, d)
+            debugPrint(result, d)
             if not result:
                 writer("  Batch failed\n")
                 # even though this failed, we have a successful callback
                 # to the I/O system
-                batchDeferred.set_result(True)
+                batchDeferred.callback(True)
                 return
             if d:
-                writer("  Batch cmd returned a deferred. Waiting to execute next line")
-                d.add_done_callback(lambda res: self.__runBatchLines(writer, batchLines, batchDeferred))
-                # we need to wait. So return the batch deferred for the 
+                writer("  Batch cmd returned a deferred. Waiting to execute next line\n")
+                d.addCallback(lambda res: self.__runBatchLines(writer, batchLines, batchDeferred))
+                d.addErrback(lambda res: self.__runBatchLines(writer, batchLines, batchDeferred))
+                # we need to wait. So return the batch deferred for the
                 # i/o system to wait on.
                 return batchDeferred
         writer("Batch Complete\n")
-        batchDeferred.set_result(True)
+        batchDeferred.callback(True)
         # all done. No batch deferred required (return none)
 
     def __batch(self, writer, batchFile):
         if not os.path.exists(batchFile):
             writer("No such file %s\n" % batchFile)
             return
-        d = asyncio.Future()
+        d = Deferred()
         with open(batchFile) as f:
             batchLines = f.readlines()
             d = self.__runBatchLines(writer, batchLines, d)
@@ -564,6 +585,10 @@ class CLIShell(LineReceiver, CompleterInterface):
             self.transport.write("Unknown command %s\n" % cmd)
             return (False, None)
         return callbackHandler.process(cmdArgs, self.transport.write)
+
+DEBUG = False
+def debugPrint(*s):
+    if DEBUG: print("[%s]" % round(time.time() % 1e4, 4), *s)
 
 
 if __name__=="__main__":

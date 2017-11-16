@@ -1,50 +1,69 @@
-# pw: testtest
+echo "This script DELETES several files presumed to be from previous tests."
+echo "Check you're not in an important directory before running this"
+read -r -p "Continue? [y/N] " response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+then
 
-# Clean up bitpoints files
-rm bitpoints.10.*
+	# Clean up bitpoints files
+	rm bitpoints.10.*
+	rm bp*.*
+	# Clean up receipt files
+	rm bank_receipt.*.*
 
-echo =================== PrintingPress create ===================
-python3 PrintingPress.py create certs/signed_certs/5001cert certs/signed_certs/5001pk mint2
+	# Clean up previous run files
+	rm mint2
+	rm pwds
 
-echo =================== PrintingPress mint ===================
-python3 PrintingPress.py mint 10:10 certs/signed_certs/5001cert mint2
+	# Configurations
+	certPath="certs/signed_certs/5001cert"
+	keyPath="certs/signed_certs/5001pk"
 
-bitpointsfile="$(ls | grep bitpoints)"
+	badCert="certs/signed_certs/6001cert"
 
-echo =================== PrintingPress info ===================
-python3 PrintingPress.py info $bitpointsfile
+	echo =================== PrintingPress create ===================
+	python3 PrintingPress.py create $certPath $keyPath mint2
 
-echo =================== PrintingPress validate ===================
-python3 PrintingPress.py validate $bitpointsfile certs/signed_certs/5001cert
+	echo =================== PrintingPress mint ===================
+	python3 PrintingPress.py mint 10:10 $certPath mint2
 
-# pw: banking
+	bitpointsfile="$(ls | grep bitpoints)"
 
-echo =================== BankCore full_test ===================
-python3 BankCore.py test certs/signed_certs/5001cert certs/signed_certs/5001pk $bitpointsfile certs/signed_certs/6001cert
+	echo =================== PrintingPress info ===================
+	python3 PrintingPress.py info $bitpointsfile
 
-echo =================== BankCore balances ===================
-python3 BankCore.py balances certs/signed_certs/5001cert test_bankcore_db
+	echo =================== PrintingPress validate ===================
+	python3 PrintingPress.py validate $bitpointsfile $certPath
 
-# pw: userpw
-echo =================== OnlineBank pw user add ===================
-echo Adding user fadyuser
-python3 OnlineBank.py pw pwds user add fadyuser
-echo Adding user sethuser
-python3 OnlineBank.py pw pwds user add sethuser
+	echo =================== BankCore full_test ===================
+	python3 BankCore.py test $certPath $keyPath $bitpointsfile $badCert
 
-echo =================== OnlineBank pw account add ===================
-python3 OnlineBank.py pw pwds account add "Fady'sPEM"
-# match account names with that in BankCore's full_test
+	echo =================== BankCore balances ===================
+	python3 BankCore.py balances $certPath test_bankcore_db
 
-python3 OnlineBank.py pw pwds account add "VAULT"
+	echo =================== OnlineBank pw user add ===================
+	echo Adding user fadyuser
+	python3 OnlineBank.py pw pwds user add fadyuser
+	echo Adding user sethuser
+	python3 OnlineBank.py pw pwds user add sethuser
 
-echo =================== OnlineBank pw chmod ===================
-python3 OnlineBank.py pw pwds chmod fadyuser
-python3 OnlineBank.py pw pwds chmod fadyuser "Fady'sPEM" btwda
-python3 OnlineBank.py pw pwds chmod sethuser "VAULT" btwda
+	echo =================== OnlineBank pw account add ===================
+	python3 OnlineBank.py pw pwds account add "Fady'sPEM"
+	# matching account names with those in BankCore's full_test
 
-echo =================== OnlineBank server ===================
-python3 OnlineBank.py server pwds test_bankcore_db certs/signed_certs/5001cert certs/signed_certs/5001cert
+	echo =================== OnlineBank pw chmod ===================
+	python3 OnlineBank.py pw pwds chmod fadyuser "Fady'sPEM" btwda
+	python3 OnlineBank.py pw pwds chmod sethuser "Fady'sPEM" b
+	python3 OnlineBank.py pw pwds chmod sethuser "VAULT" btwda
+	python3 OnlineBank.py pw pwds chmod sethuser "__admin__" BSAFC
 
-#echo =================== OnlineBank Client ===================
-#python3 OnlineBank.py client 20174.x.x.x certs/signed_certs/5001cert fadyuser
+	echo fadyuser Permissions:
+	python3 OnlineBank.py pw pwds chmod fadyuser
+	echo sethuser Permissions:
+	python3 OnlineBank.py pw pwds chmod sethuser
+
+	echo =================== OnlineBank server ===================
+	python3 OnlineBank.py server pwds test_bankcore_db $certPath $certPath
+
+	#echo =================== OnlineBank Client ===================
+	#python3 OnlineBank.py client 20174.1337.1337.1 $certPath fadyuser
+fi

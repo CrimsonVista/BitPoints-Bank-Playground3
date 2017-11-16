@@ -11,6 +11,7 @@ from BankMessages import *
 from Exchange import BitPoint
 
 from BankCore import Ledger, LedgerLine # For unshelving
+from AsyncIODeferred import Deferred
 
 # TODO: Change to match actual playground layout (gotta push these too)
 from CipherUtil import SHA, loadCertFromFile, RSA_SIGNATURE_MAC
@@ -21,16 +22,8 @@ from network.common.PacketHandler import SimplePacketHandler
 import playground
 from playground.network.common.Protocol import StackingProtocol
 from playground.network.common.PlaygroundAddress import PlaygroundAddress
+from playground.network.packet.PacketType import FIELD_NOT_SET
 
-# from playground.network.message import MessageData
-# from playground.network.common import Timer
-# from playground import configData
-# from playground.playgroundlog import logging, LoggingContext
-# from playground.config import LoadOptions
-# from PlaygroundNode import PlaygroundNode, StandaloneTask
-# from twisted.python.failure import Failure
-# from twisted.internet import defer
-# from apps.network.N2P import ResolvingConnector
 import logging
 logger = logging.getLogger(__file__)
 
@@ -43,7 +36,7 @@ PasswordHash = lambda pw: PasswordBytesHash(bytes(pw, "utf-8"))
 DEBUG = True
 BANK_FIXED_PLAYGROUND_ADDR = PlaygroundAddress(20174, 1337, 1337, 1)
 BANK_FIXED_PLAYGROUND_PORT = 700
-# The playground address network (___.XXXX.___.___) allowed
+# The playground address network (XXXX.___.XXXX.XXXX) allowed
 ADMIN_ZONE = 1337
 
 def callLater(delay, func):
@@ -93,8 +86,7 @@ InvalidPwFile = DummyFile()
 
 
 class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
-    # MIB_CURRENT_STATE = "CurrentState"
-    
+
     STATE_UNINIT = "Uninitialized"
     STATE_OPEN = "Open"
     STATE_ERROR = "Error"
@@ -148,7 +140,10 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         StackingProtocol.connection_made(self, transport)
         self.transport = transport
 
-        
+    def sendPacket(self, packet):
+        self.transport.write(packet.__serialize__())
+        debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
+
     def data_received(self, packet):
         debugPrint("server proto data_received")
         self.__logSecure("Received packet %s" % packet)
@@ -160,19 +155,6 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
     def __clearWithdrawlLimit(self, account):
         if account in self.__withdrawlTracking:
             del self.__withdrawlTracking[account]
-        
-    # def __loadMibs(self):
-    #     if self.MIBAddressEnabled():
-    #         self.registerLocalMIB(self.MIB_CURRENT_STATE, self.__handleMib)
-    #
-    # def __handleMib(self, mib, args):
-    #     if mib.endswith(self.MIB_CURRENT_STATE):
-    #         resp = []
-    #         resp.append("STATE: %s" % self.__state)
-    #         for k in self.__connData.keys():
-    #             resp.append("%s: %s" % (str(k), str(self.__connData[k])))
-    #         return resp
-    #     return []
     
     # def handleError(self, message, reporter=None, stackHack=0):
     #     self.__logSecure("Error Reported %s" % message )
@@ -219,7 +201,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response.ServerNonce = self.__connData["ServerNonce"]
             response.RequestId = requestId
         response.ErrorMessage = errMsg
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         if fatal:
             debugPrint("server proto error Closing connection!")
             self.__state = self.STATE_ERROR
@@ -235,7 +217,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.ServerNonce = self.__connData.get("ServerNonce",0)
         response.RequestId = requestId
         response.ErrorMessage = errMsg
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         return None
     
     def __getSessionAccount(self, msgObj):
@@ -253,6 +235,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if account and self.__pwDb.hasAccount(account):
             access = self.__pwDb.currentAccess(userName, account)
         else: access = ''
+        debugPrint("server __getSessionAccount acc:", account, "access:", access)
         return (account, access)
     
     def __validateAdminPeerConnection(self):
@@ -323,28 +306,28 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.Account = ""
         self.__logSecure("Request for open with nonce %d, sending back %d" % (msgObj.ClientNonce,
                                                                               self.__connData["ServerNonce"]))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleCurrentAccount(self, protocol, msg):
         # permissions: None
         msgObj = msg
         account, access = self.__getSessionAccount(msgObj)
-        if account == None: # require
+        if account is None: # require
             return 
         response = self.__createResponse(msgObj, CurrentAccountResponse)
         response.Account = account
         response.RequestId = msgObj.RequestId
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleListAccounts(self, protocol, msg):
         # permissions: regular - None, for a specific user, Admin(B)
         msgObj = msg
         account, access = self.__getSessionAccount(msgObj)
-        if account == None:
+        if account is None:
             return
-        if hasattr(msgObj,"User"):
+        if msgObj.User != FIELD_NOT_SET:
             adminAccessData = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccessData == None:
+            if adminAccessData is None:
                 # error already reported.
                 return None
             if "B" not in adminAccessData:
@@ -354,19 +337,19 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         else:
             userName = self.__connData["LoginName"]
         accountAccessData = self.__pwDb.currentAccess(userName)
-        accountNames = accountAccessData.keys()
+        accountNames = list(accountAccessData.keys())
         response = self.__createResponse(msgObj, ListAccountsResponse)
         response.RequestId = msgObj.RequestId
         response.Accounts = accountNames
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleListUsers(self, protocol, msg):
         msgObj = msg
         account, access = self.__getSessionAccount(msgObj)
         users = []
-        if account == None:
+        if account is None:
             return
-        if not hasattr(msgObj,"Account"):
+        if msgObj.Account == FIELD_NOT_SET:
             # use current account, unless account is not set, in which case
             # it has to be administrator
             accountToList = account
@@ -377,7 +360,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if accountToList == '':
             adminAccessData = self.__getAdminPermissions(msgObj.RequestId)
             self.__logSecure("List of all users required admin access")
-            if adminAccessData == None:
+            if adminAccessData is None:
                 # error already reported
                 return None
             accountToList = None
@@ -393,13 +376,13 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.RequestId = msgObj.RequestId
         response.Users = users
         self.__logSecure("sending list of %d users" % len(users))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleSwitchAccount(self, protocol, msg):
         # permissions: some permissions on account, if an admin account, 'S'
         msgObj = msg
         account, access = self.__getSessionAccount(msgObj)
-        if account == None:
+        if account is None:
             return
         desiredAccount = msgObj.Account
         
@@ -409,7 +392,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             result = False
         elif desiredAccount in self.ADMIN_ACCOUNTS:
             adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess == None:
+            if adminAccess is None:
                 self.__logSecure("ATTEMPT TO ACCESS ADMIN ACCOUNT %s" % desiredAccount)
                 return
             if 'S' not in adminAccess:
@@ -429,7 +412,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.ErrorMessage = "Could not switch accounts"
         response.RequestId = msgObj.RequestId
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
     
     def __handleBalanceRequest(self, protocol, msg):
         # permissions: regular(b)
@@ -441,19 +424,19 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Account must be selected"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
             return None
         if 'b' not in access:
             self.__logSecure("Required 'b' access for account %s, but had %s" % (account, access))
             return self.__sendPermissionDenied("No Permission to check Balances", 
                                                msgObj.RequestId)
-        balance = self.__bank.getBalance(account)
+        balance = self.__bank.getBalance(account) or 0
         debugPrint("Balance for account", account, ":", balance)
         response = self.__createResponse(msgObj, BalanceResponse)
         response.RequestId = msgObj.RequestId
         response.Balance = balance
         self.__logSecure("Sending back balance")
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleAdminBalanceRequest(self, protocol, msg):
         # permissions: Admin(B)
@@ -474,7 +457,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.Accounts = accountList
         response.Balances = balancesList
         self.__logSecure("Sending back %d balances" % len(balancesList))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleTransferRequest(self, protocol, msg):
         # permissions: regular(t)
@@ -485,7 +468,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Account must be selected"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
         if not 't' in access:
             self.__logSecure("Requires 't' access to transfer from %s, but have %s" % (account, access))
             return self.__sendPermissionDenied("Requires 't' access", msgObj.RequestId)
@@ -515,7 +498,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.Receipt = receipt
         response.ReceiptSignature = signature
         self.__logSecure("Transfer succeeded, sending receipt")
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleDeposit(self, protocol, msg):
         # requires: regular(d)
@@ -526,7 +509,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Account must be selected"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
         if 'd' not in access:
             self.__logSecure("Requires 'd' access to deposit in %s, but have %s" % (account, access))
             return self.__sendPermissionDenied("Requires 'd' access", msgObj.RequestId)
@@ -557,7 +540,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
                 response.RequestId = msgObj.RequestId
                 response.Receipt = receipt
                 response.ReceiptSignature = signature
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleWithdrawal(self, protocol, msg):
         # requires: regular(d)
@@ -568,7 +551,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Account must be selected"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
         if 'd' not in access:
             self.__logSecure("Requires 'd' access to withdraw from %s but have %s" % (account, access))
             return self.__sendPermissionDenied("Requires 'd' access", msgObj.RequestId)
@@ -578,7 +561,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Over Limit"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
             return
         result = self.__bank.withdrawCash(account,msgObj.Amount)
         if not result.succeeded():
@@ -597,7 +580,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response = self.__createResponse(msgObj, WithdrawalResponse)
             response.RequestId = msgObj.RequestId
             response.bpData = bpData
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __isValidUsername(self, name):
         for letter in name:
@@ -622,7 +605,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if (newUser or userName != self.__connData["LoginName"]):
             # if this is a new user, must be admin because couldn't login
             adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess == None:
+            if adminAccess is None:
                 self.__logSecure("Failed. Admin access required to create user, or change other user")
                 return
             if "A" not in adminAccess:
@@ -632,35 +615,35 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             if newUser and self.__pwDb.hasUser(userName):
                 self.__logSecure("Tried to create user %s that already exists" % userName)
                 errorResponse.ErrorMessage = "User %s already exists" % userName
-                self.transport.write(errorResponse.__serialize__())
+                self.sendPacket(errorResponse)
                 return
             elif newUser and not self.__isValidUsername(userName):
                 self.__logSecure("Attempt to create user with invalid name [%s]" % userName)
                 errorResponse.ErrorMessage = "Username invalid. Only letters, numbers, and underscores."
-                self.transport.write(errorResponse.__serialize__())
+                self.sendPacket(errorResponse)
                 return
             elif not newUser and not self.__pwDb.hasUser(userName):
                 self.__logSecure("Attempt to change password for non-existent user [%s]" % userName)
                 errorResponse.ErrorMessage = "User %s does not exist" % userName
-                self.transport.write(errorResponse.__serialize__())
+                self.sendPacket(errorResponse)
                 return
         elif msgObj.oldPwHash == '':
             # Cannot allow this.
             self.__logSecure("Attempt to change username %s without previous hash" % userName)
             errorResponse.ErrorMessage = "No password hash specified"
-            self.transport.write(errorResponse.__serialize__())
+            self.sendPacket(errorResponse)
             return
-        elif self.__pwDb.currentUserPassword(userName) != msgObj.oldPwHash:
+        elif self.__pwDb.currentUserPassword(userName) != eval(msgObj.oldPwHash):
                 self.__logSecure("Incorrect previous password for %s password change" % userName)
                 errorResponse.ErrorMessage = "Invalid Password"
-                self.transport.write(errorResponse.__serialize__())
+                self.sendPacket(errorResponse)
                 return
             
-        pwHash = msgObj.newPwHash
+        pwHash = eval(msgObj.newPwHash)
         self.__pwDb.createUser(userName, pwHash, modify=True)
         self.__pwDb.sync()
         self.__logSecure("Password changed")
-        self.transport.write(okResponse.__serialize__())
+        self.sendPacket(okResponse)
         
     def __handleCreateAccount(self, protocol, msg):
         # requires Admin(A)
@@ -682,23 +665,25 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         result = self.__bank.createAccount(newAccountName)
         if result.succeeded():
             self.__logSecure("New account %s created" % newAccountName)
-            self.__pwDb.createAccount(newAccountName)
+            if not self.__pwDb.hasUser(newAccountName):
+            # should only happen if we manually added a user to pwDB
+                self.__pwDb.createAccount(newAccountName)
             self.__pwDb.sync()
         else:
             self.__logSecure("Internal Failure in creating account %s" % newAccountName)
             response = self.__createResponse(msgObj, RequestFailure)
             response.ErrorMessage = "Could not create account. Internal error"
         response.RequestId = msgObj.RequestId
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleCurAccess(self, protocol, msg):
         msgObj = msg
         userName = self.__connData["LoginName"]
-        if hasattr(msgObj, "UserName"):
+        if msgObj.UserName != FIELD_NOT_SET:
             checkUserName = msgObj.UserName
         else:
             checkUserName = userName
-        if hasattr(msgObj, "AccountName"):
+        if msgObj.AccountName != FIELD_NOT_SET:
             accountName = msgObj.AccountName
         else: accountName = None
         self.__logSecure("Attempt to check access of %s on account %s" % (checkUserName, accountName))
@@ -706,7 +691,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if userName != checkUserName and not accountName:
             # requires admin access to get general permissions for other user
             adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess == None:
+            if adminAccess is None:
                 self.__logSecure("Checking this access requires administrative access")
                 return
             if 'A' not in adminAccess:
@@ -736,7 +721,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.Accounts = accounts
         response.Access = accountsAccess
         self.__logSecure("Sending back access information for %s on %d accounts" % (checkUserName, len(accountsAccess)))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
         
     def __handleChangeAccess(self, protocol, msg):
         # if no account is specified, it must be for the current account with 'a' access
@@ -746,17 +731,17 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         userName = self.__connData["LoginName"]
         changeUserName = msgObj.UserName
         account, access = self.__getSessionAccount(msgObj)
-        if account == None:
+        if account is None:
             self.__logSecure("Cannot change access. There was an error in state")
             return None # this was an actual error
-        if not account and not hasattr(msgObj, "Account"):
+        if not account and msgObj.Account == FIELD_NOT_SET:
             self.__logSecure("Cannot change access, no account specified, and no current account selected")
             response = self.__createResponse(msgObj, RequestFailure)
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Account must be selected or specified"
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
             return
-        if hasattr(msgObj, "Account"):
+        if msgObj.Account != FIELD_NOT_SET:
             account = msgObj.Account
             self.__logSecure("Trying to change access for %s in account %s" % (userName, account))
             access = self.__pwDb.currentAccess(userName, account)
@@ -764,7 +749,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             # doesn't own the account. Check admin 
             # 
             adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess == None:
+            if adminAccess is None:
                 self.__logSecure("Access change request requires an administrator")
                 return
             if 'A' not in adminAccess:
@@ -783,26 +768,26 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Invalid access string %s" % msgObj.AccessString
             self.__logSecure("Tried to change access to invalid %s" % msgObj.AccessString)
-            self.transport.write(response.__serialize__())
+            self.sendPacket(response)
             return
         self.__pwDb.configureAccess(changeUserName, account, msgObj.AccessString)
         self.__pwDb.sync()
         response = self.__createResponse(msgObj, RequestSucceeded)
         response.RequestId = msgObj.RequestId
         self.__logSecure("User %s access to %s changed to %s" % (changeUserName, account, msgObj.AccessString))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
 
     def __handleLedgerRequest(self, protocol, msg):
         msgObj = msg
         #account, access = self.__getSessionAccount(msgObj)
         userName = self.__connData["LoginName"]
-        accountToGet = hasattr(msgObj,"Account") and msgObj.Account or None
+        accountToGet = msgObj.Account != FIELD_NOT_SET and msgObj.Account or None
         self.__logSecure("Request ledger for user %s and account %s" % (userName, accountToGet))
         if not accountToGet:
             # No account specified. Get the entire bank ledger.
             # this is administrative access only.
             adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess == None:
+            if adminAccess is None:
                 self.__logSecure("Requesting an all-accounts ledger requires admin access")
                 return
             if 'A' not in adminAccess:
@@ -816,7 +801,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             if 'a' not in accountToGetAccess:
                 # don't kill the connection if we don't have admin. Just tell them.
                 adminAccess = self.__getAdminPermissions(msgObj.RequestId, fatal=False)
-                if adminAccess == None or 'A' not in adminAccess:
+                if adminAccess is None or 'A' not in adminAccess:
                     self.__logSecure("User %s attempting to get ledger for %s requires 'a' or 'A', but have %s and %s" %
                                      (userName, accountToGet, accountToGetAccess, adminAccess))
                     return self.__sendPermissionDenied("Requires admin access or regular 'a'", 
@@ -831,7 +816,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         response.RequestId = msgObj.RequestId
         response.Lines = lines
         self.__logSecure("User %s getting ledger for %s (%d lines" % (userName, accountToGet, len(lines)))
-        self.transport.write(response.__serialize__())
+        self.sendPacket(response)
             
     def __handleClose(self, protocol, msg):
         debugPrint("server __handleClose", msg.DEFINITION_IDENTIFIER)
@@ -881,10 +866,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         self.registerPacketHandler(LedgerResponse, self.__handleStdSessionResponse)
         self.registerPacketHandler(ServerError, self.__handleServerError)
         debugPrint("Client protocol built.")
-        # x = BankClientSimpleCommand()
-        # d = x(self, None, lambda proto: proto.currentAccount())
-        # d.addCallback(lambda result: debugPrint("Final result:", result))
-        
+
     def __errorCallbackWrapper(self, e, d):
         self.__error(e)
         d.errback(e)
@@ -926,9 +908,14 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         else:
             debugPrint("CONNECTION deferred not found")
 
+    def sendPacket(self, packet):
+        self.transport.write(packet.__serialize__())
+        debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
+
     def data_received(self, packet):
         debugPrint("client proto data_received")
         try:
+            debugPrint("Received", PacketType.Deserialize(packet).DEFINITION_IDENTIFIER)
             self.handlePacket(None, packet)
         except Exception as e:
             print(traceback.format_exc())
@@ -959,7 +946,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         return d
 
     def loginToServer(self):
-        debugPrint("client proto loginToServer called: ", "CONNECTION" in self.__deferred, self.__state != self.STATE_UNINIT)
+        debugPrint("client proto loginToServer")
         if "CONNECTION" in self.__deferred:
             # we haven't connected yet!
             raise Exception("Can't login. Connection not yet made.")
@@ -973,8 +960,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         self.__state = self.STATE_WAIT_FOR_LOGIN
         d = Deferred()
         self.__deferred["LOGIN"] = d
-        self.transport.write(openMsg.__serialize__())
-        debugPrint("client sent openMsg", openMsg)
+        self.sendPacket(openMsg)
         return d
 
     def __handleSessionOpen(self, protocol, msg):
@@ -1053,12 +1039,13 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         callLater(1,self.transport.close)
 
     def listAccounts(self, userName=None):
+        debugPrint("client listAccounts username:", userName)
         if self.__state != self.STATE_OPEN:
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         listMsg, d = self.__createStdSessionRequest(ListAccounts)
         if userName:
             listMsg.User = userName
-        self.transport.write(listMsg.__serialize__())
+        self.sendPacket(listMsg)
         return d
 
     def listUsers(self, account=None):
@@ -1067,7 +1054,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         listMsg, d = self.__createStdSessionRequest(ListUsers)
         if account:
             listMsg.Account = account
-        self.transport.write(listMsg.__serialize__())
+        self.sendPacket(listMsg)
         return d
 
     def switchAccount(self, accountName):
@@ -1075,14 +1062,14 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         switchMsg, d = self.__createStdSessionRequest(SwitchAccount)
         switchMsg.Account = accountName
-        self.transport.write(switchMsg.__serialize__())
+        self.sendPacket(switchMsg)
         return d
 
     def currentAccount(self):
         if self.__state != self.STATE_OPEN:
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         currentMsg, d = self.__createStdSessionRequest(CurrentAccount)
-        self.transport.write(currentMsg.__serialize__())
+        self.sendPacket(currentMsg)
         return d
 
     def currentAccess(self, userName=None, accountName=None):
@@ -1093,14 +1080,14 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             curAccessMsg.UserName = userName
         if accountName:
             curAccessMsg.AccountName = accountName
-        self.transport.write(curAccessMsg.__serialize__())
+        self.sendPacket(curAccessMsg)
         return d
 
     def getBalance(self):
         if self.__state != self.STATE_OPEN:
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         balanceMsg, d = self.__createStdSessionRequest(BalanceRequest)
-        self.transport.write(balanceMsg.__serialize__())
+        self.sendPacket(balanceMsg)
         return d
 
     def transfer(self, dstAccount, amount, memo):
@@ -1110,7 +1097,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         transferMsg.DstAccount = dstAccount
         transferMsg.Amount = amount
         transferMsg.Memo = memo
-        self.transport.write(transferMsg.__serialize__())
+        self.sendPacket(transferMsg)
         return d
 
     def close(self):
@@ -1120,7 +1107,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         self.__state = self.STATE_UNINIT
         if self.transport:
             closeMsg, d = self.__createStdSessionRequest(Close, noRequestId=True)
-            self.transport.write(closeMsg.__serialize__())
+            self.sendPacket(closeMsg)
             callLater(.1, self.transport.close)
 
     def __handleRequestFailure(self, protocol, msg):
@@ -1138,7 +1125,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         if self.state() != self.STATE_OPEN:
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         balanceMsg, d = self.__createStdSessionRequest(AdminBalanceRequest)
-        self.transport.write(balanceMsg.__serialize__())
+        self.sendPacket(balanceMsg)
         return d
 
     def deposit(self, serializedBp):
@@ -1147,7 +1134,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         depositMsg, d = self.__createStdSessionRequest(DepositRequest)
         depositMsg.bpData = serializedBp
         # debugPrint(depositMsg.bpData[:15], "...", depositMsg.bpData[-15:], len(depositMsg.bpData), type(depositMsg.bpData))
-        self.transport.write(depositMsg.__serialize__())
+        self.sendPacket(depositMsg)
         return d
 
     def withdraw(self, amount):
@@ -1155,7 +1142,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         withdrawalMsg, d = self.__createStdSessionRequest(WithdrawalRequest)
         withdrawalMsg.Amount = amount
-        self.transport.write(withdrawalMsg.__serialize__())
+        self.sendPacket(withdrawalMsg)
         return d
 
     def adminCreateUser(self, loginName, password):
@@ -1166,7 +1153,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         createMsg.oldPwHash = ''
         createMsg.newPwHash = PasswordHash(password)
         createMsg.NewUser = True
-        self.transport.write(createMsg.__serialize__())
+        self.sendPacket(createMsg)
         return d
 
     def adminCreateAccount(self, accountName):
@@ -1174,7 +1161,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
         createMsg, d = self.__createStdSessionRequest(CreateAccountRequest)
         createMsg.AccountName = accountName
-        self.transport.write(createMsg.__serialize__())
+        self.sendPacket(createMsg)
         return d
 
     def changePassword(self, newPassword, oldPassword=None, loginName=None):
@@ -1189,7 +1176,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         else: changeMsg.oldPwHash = ""
         changeMsg.newPwHash = PasswordHash(newPassword)
         changeMsg.NewUser = False
-        self.transport.write(changeMsg.__serialize__())
+        self.sendPacket(changeMsg)
         return d
 
     def changeAccess(self, username, access, account=None):
@@ -1200,7 +1187,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         changeMsg.AccessString = access
         if account:
             changeMsg.Account = account
-        self.transport.write(changeMsg.__serialize__())
+        self.sendPacket(changeMsg)
         return d
 
     def exportLedger(self, account):
@@ -1209,94 +1196,20 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         ledgerMsg, d = self.__createStdSessionRequest(LedgerRequest)
         if account:
             ledgerMsg.Account = account
-        self.transport.write(ledgerMsg.__serialize__())
+        self.sendPacket(ledgerMsg)
         return d
 
-'''
-class BankClientSimpleCommand(object):
-    def __init__(self):
-        pass
-
-    def __failed(self, final_d, protocol, errMsg):
-        debugPrint("client simple command __failed called: ", errMsg)
-        protocol.close()
-        final_d.errback(Exception(errMsg))
-        return Exception(errMsg)
-
-    def __cmdSucceeded(self, final_d, protocol, result ):
-        debugPrint("client simple cmd __cmdSucceeded", result)
-        protocol.close()
-        final_d.callback(result)
-
-    def __switchAccountSucceeded(self, cmdState):
-        debugPrint("client simple cmd __switchAccountSucceeded called")
-        protocol, account, cmd, args, kargs, final_d = cmdState
-        d = cmd(protocol, *args, **kargs)
-        d.addCallback(lambda result: self.__cmdSucceeded(final_d, protocol, result))
-        d.addErrback(lambda failure: self.__failed(final_d, protocol,
-                                                   "Could not execute bank command. Reason: %s" % str(failure)))
-
-    def __loginSucceeded(self, cmdState):
-        debugPrint("client simple command __loginSucceeded called")
-        protocol, account, cmd, args, kargs, final_d = cmdState
-        if account:
-            d = protocol.switchAccount(account)
-            d.addCallback(lambda result: self.__switchAccountSucceeded(cmdState))
-            d.addErrback(lambda failure: self.__failed(final_d, protocol,
-                                                       "Could not switch to account %s. Reason: %s" % (account, str(failure))))
-        else:
-            d = cmd(protocol, *args, **kargs)
-            d.addCallback(lambda result: self.__cmdSucceeded(final_d, protocol, result))
-            d.addErrback(lambda failure: self.__failed(final_d, protocol,
-                                                       "Could not execute bank command. Reason: %s" % str(failure)))
-
-    def __call__(self, protocol, account, cmd, *args, **kargs):
-        debugPrint("client simple command __call__ed")
-        conn_d = protocol.waitForConnection()
-        final_d = Deferred()
-        cmdState = [protocol, account, cmd, args, kargs, final_d]
-        conn_d.addCallback(lambda result: self.__startLogin(cmdState))
-        conn_d.addErrback(lambda failure: self.__failed(final_d, protocol, "Could not connect. %s" % str(failure)))
-        return final_d
-
-    def __startLogin(self, cmdState):
-        debugPrint("client simple command __startLogin called")
-        protocol, account, cmd, args, kargs, final_d = cmdState
-        d = protocol.loginToServer()
-        d.addCallback(lambda result: self.__loginSucceeded(cmdState))
-        d.addErrback(lambda failure: self.__failed(final_d, protocol,
-                                                   "Could not login to bank. Reason: %s" % str(failure)))
-        return final_d
-'''
 
 class PlaygroundOnlineBank:
-    # MIB_BALANCES = "BankBalances"
 
     def __init__(self, passwordFile, bank):
         #super(PlaygroundOnlineBank, self).__init__(self)
         self.__bank = bank
         self.__passwordData = PasswordData(passwordFile)
 
-    # def __loadMibs(self):
-    #     if self.MIBAddressEnabled():
-    #         self.registerLocalMIB(self.MIB_BALANCES, self.__handleMib)
-    #
-    # def __handleMib(self, mib, args):
-    #     if mib.endswith(self.MIB_BALANCES):
-    #         balances = []
-    #         for account in self.__bank.getAccounts():
-    #             balances.append("%s: %s (b^)" % (account, str(self.__bank.getBalance(account))))
-    #         return balances
-    #     return []
-    #
-    # def configureMIBAddress(self, *args, **kargs):
-    #     ClientApplicationServer.ClientApplicationServer.configureMIBAddress(self, *args, **kargs)
-    #     self.__loadMibs()
-
     def buildProtocol(self):
         p = BankServerProtocol(self.__passwordData, self.__bank)
         return p
-
 
 
 class PlaygroundOnlineBankClient:
@@ -1334,6 +1247,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.loginToServer()
         self.__d.addCallback(self.__login)
         self.__d.addErrback(self.__noLogin)
+        return self.__d
 
     def __login(self, success):
         self.__connected = True
@@ -1465,12 +1379,12 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.reset()
 
     def __failed(self, e):
-        self.transport.write("  Operation failed. Reason: %s\n" % str(e))
+        self.transport.write("\033[91m  Operation failed. Reason: %s\033[0m\n" % str(e))
         self.reset()
         return Exception(e)
 
     def handleError(self, message, reporter=None, stackHack=0):
-        self.transport.write("Client Error: %s\n" % message)
+        self.transport.write("\033[91mClient Error: %s\033[0m\n" % message)
 
     def quit(self, writer=None, *args):
         self.__bankClient.close()
@@ -1480,6 +1394,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         callLater(0, self.transport.close)
         #callLater(.1, self.__clientBase.disconnectFromPlaygroundServer)
         callLater(.1, lambda: self.higherProtocol() and self.higherProtocol().close)
+        return Deferred()
 
     def handleException(self, e, reporter=None, stackHack=0, fatal=False):
         debugPrint("CLI handleException")
@@ -1499,15 +1414,8 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             debugPrint("CLI Making a client connection...")
             coro = playground.getConnector().create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, BANK_FIXED_PLAYGROUND_PORT)
             debugPrint("CLI Running client protocol coroutine...")
-            # transport, protocol = loop.run_until_complete(coro)
             fut = asyncio.run_coroutine_threadsafe(coro, self.__asyncLoop)
             fut.add_done_callback(self.__handleClientConnection)
-
-            # d = connector.connect(self.__bankClientFactory,
-            #                       self.__bankAddr,
-            #                       BANK_FIXED_PLAYGROUND_PORT,
-            #                       self.__connectionType)
-            # d.addCallback(self.__bankConnected)
             debugPrint("CLI connection_made done")
         except Exception as e:
             print(traceback.format_exc())
@@ -1530,7 +1438,8 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             self.__d.addCallback(self.__loginToServer)
             self.__d.addErrback(self.__noLogin)
             self.transport.write("Logging in to bank. Waiting for server\n")
-        except Exception as e:
+            return self.__d
+        except:
             print(traceback.format_exc())
             self.transport.close()
 
@@ -1577,6 +1486,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.currentAccess(user, account)
         self.__d.addCallback(self.__curAccess)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accessSet(self, writer, user, access, account=None):
         if access == "*":
@@ -1586,6 +1496,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.changeAccess(user, access, account)
         self.__d.addCallback(self.__changeAccess)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __listAccounts(self, writer, user=None):
         if user and not self.__admin:
@@ -1594,16 +1505,19 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.listAccounts(user)
         self.__d.addCallback(self.__listAccountsResponse)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __listUsers(self, writer, account=None):
         self.__d = self.__bankClient.listUsers(account)
         self.__d.addCallback(self.__listUsersResponse)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accountCurrent(self, writer):
         self.__d = self.__bankClient.currentAccount()
         self.__d.addCallback(self.__currentAccount)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accountSwitch(self, writer, switchToAccount):
         if switchToAccount == "__none__":
@@ -1611,6 +1525,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.switchAccount(switchToAccount)
         self.__d.addCallback(self.__switchAccount)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accountBalance(self, writer, all=False):
         if not all:
@@ -1624,6 +1539,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             self.__d = self.__bankClient.adminGetBalances()
             self.__d.addCallback(self.__balances)
             self.__d.addErrback(self.__failed)
+        return self.__d
             
     def __accountDeposit(self, writer, bpFile):
         if not os.path.exists(bpFile):
@@ -1634,6 +1550,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             self.__d = self.__bankClient.deposit(bpData)
             self.__d.addCallback(self.__receipt)
             self.__d.addErrback(self.__failed)
+        return self.__d
             
     def __accountWithdrawArgsHandler(self, writer, amountStr):
         try:
@@ -1650,6 +1567,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.withdraw(amount)
         self.__d.addCallback(self.__withdrawl)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accountTransferArgsHandler(self, writer, dst, amountStr, memo):
         try:
@@ -1666,6 +1584,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.transfer(dstAcct, amount, memo)
         self.__d.addCallback(self.__receipt)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __accountCreate(self, writer, accountName):
         if not self.__admin:
@@ -1674,6 +1593,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.adminCreateAccount(accountName)
         self.__d.addCallback(self.__createAccount)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __userCreate(self, writer, userName):
         if not self.__admin:
@@ -1687,6 +1607,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.adminCreateUser(userName, password)
         self.__d.addCallback(self.__createAccount)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __userPasswd(self, writer, userName=None):
         if not userName:
@@ -1705,6 +1626,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.changePassword(password2, loginName=userName, oldPassword=oldPassword)
         self.__d.addCallback(self.__changePassword)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __exportLedger(self, writer, account=None):
         if not account and not self.__admin:
@@ -1713,6 +1635,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = self.__bankClient.exportLedger(account)
         self.__d.addCallback(self.__exportLedgerResponse)
         self.__d.addErrback(self.__failed)
+        return self.__d
         
     def __loadCommands(self):
         cscc = CLIShell.CLICommand
@@ -1932,7 +1855,7 @@ class PlaygroundNodeControl(object):
         coro = playground.getConnector().create_playground_server(self.bankServer.buildProtocol, BANK_FIXED_PLAYGROUND_PORT)
         server = loop.run_until_complete(coro)
         print("Bank Server Started at {}".format(server.sockets[0].gethostname()))
-        print("To access start a bank client protocol to %s:%s" % (BANK_FIXED_PLAYGROUND_ADDR,BANK_FIXED_PLAYGROUND_PORT))
+        print("To access start a bank client protocol to %s:%s" % (BANK_FIXED_PLAYGROUND_ADDR,BANK_FIXED_PLAYGROUND_PORT)) # TODO: change address to display the correct host Playground address
         loop.run_forever()
         loop.close()
         return (True,"")
@@ -1947,7 +1870,7 @@ class PlaygroundNodeControl(object):
             return (False, "Could not locate cert file " + certPath)
 
         # remove this to accept the provided address instead
-        remoteAddress = BANK_FIXED_PLAYGROUND_ADDR
+        # remoteAddress = BANK_FIXED_PLAYGROUND_ADDR
 
         cert = loadCertFromFile(certPath)
         passwd = getpass.getpass("Enter bank account password for %s: "%loginName)
@@ -1960,19 +1883,8 @@ class PlaygroundNodeControl(object):
 
         loop = asyncio.get_event_loop()
         # loop.set_debug(enabled=True)
-        # control.connect(protocol)
         loop.call_soon(initShell)
         loop.run_forever()
-        # loop.close()
-
-        # loop = asyncio.get_event_loop()
-        # loop.set_debug(enabled=True)
-        # coro = playground.getConnector().create_playground_connection(uiFactory, remoteAddress, 101)
-        # transport, protocol = loop.run_until_complete(coro)
-        # print("Echo Client Connected. Starting UI t:{}. p:{}".format(transport, protocol))
-        # #control.connect(protocol)
-        # loop.run_forever()
-        # loop.close()
         return (True, "")
     
     def getStdioProtocol(self):
@@ -2060,19 +1972,20 @@ class PasswordData(object):
         return accountName in self.__tmpAccountTable
     
     def iterateAccounts(self):
-        return self.__tmpAccountTable.keys()
+        return list(self.__tmpAccountTable.keys())
     
     def iterateUsers(self, account=None):
         if not account:
-            return self.__tmpPwTable.keys()
+            return list(self.__tmpPwTable.keys())
         else:
-            return [username for username in self.__tmpUserTable.keys()
+            return [username for username in list(self.__tmpUserTable.keys())
                     if account in self.__tmpUserTable[username]]
     
     def __getUserPw(self, userName):
         return self.__tmpPwTable[userName]
     
     def currentAccess(self, userName, accountName=None):
+        debugPrint("pwD currentAccess un:", userName,"acc:", accountName)
         access = self.__tmpUserTable.get(userName, {})
         if accountName:
             return access.get(accountName, {})
@@ -2121,22 +2034,16 @@ class PasswordData(object):
         if not self.hasUser(userName):
             raise Exception("No such user %s to remove" % userName)
         self.__delUser(userName)       
-        
-# control = PlaygroundNodeControl()
-# Name = control.Name
-# start = control.start
-# stop = control.stop
-# getStdioProtocol = control.getStdioProtocol
+
 
 # TODO: Update the usage
 USAGE = """
 OnlineBank.py pw <passwordFile> user [add <username>] [del <username>] [change <username>]
 OnlineBank.py pw <passwordFile> account [add <accountname]
-OnlineBank.py pw <passwordFile> chmod <username> <accountname> [<privileges>]
+OnlineBank.py pw <passwordFile> chmod <username> [<accountname> [<privileges>]]
 \tPrivileges must be one of %s or %s
-OnlineBank.py server <passwordFile> <bankpath> <cert> <playground server IP> <playground server port> <connection_type>
-OnlineBank.py server <bank addr> <chaperone addr> <config>
-OnlineBank.py client_cli -f <config> 
+OnlineBank.py server <passwordFile> <bankpath> <cert> [<mintcertpath>]
+OnlineBank.py client <bank Playground addr> <cert> <user name>
 """ % (PasswordData.ACCOUNT_PRIVILEGES, PasswordData.ADMIN_PRIVILEGES)
 
 
@@ -2154,42 +2061,8 @@ def getPasswordHashRoutine(currentPw=None):
             newPw = None
     return PasswordHash(newPw)
 
-# A wrapper class for asyncio.Future so we can use errorBacks
-# (also so I don't have to change a hundred lines of code...)
-class Deferred:
-    def __init__(self):
-        self.f = asyncio.Future()
-
-    def __cb(self, fut, func):
-        # might want to remove .done() check to better catch errors
-        # (.result() throws an error if not done)
-        if fut.done() and fut.result():
-            return func(fut.result())
-        return None # should I return an exception instead?
-
-    def addCallback(self, func):
-        self.f.add_done_callback(lambda fut: self.__cb(fut,func))
-
-    def callback(self, res):
-        self.f.set_result(res)
-        return self.f # is this necessary?
-
-    def __eb(self, fut, func):
-        # might want to remove .done() check to better catch errors
-        # (.exception() throws an error if not done)
-        if fut.done() and fut.exception():
-            return func(fut.exception())
-        return None # should I return an exception instead?
-
-    def addErrback(self, func):
-        self.f.add_done_callback(lambda fut: self.__eb(fut,func))
-
-    def errback(self, exc):
-        self.f.set_exception(exc)
-        return self.f # is this necessary?
-
 def debugPrint(*s):
-    if DEBUG: print("[%s]" % (time.time() % 1e4), *s)
+    if DEBUG: print("\033[93m[%s]" % round(time.time() % 1e4, 4), *s, "\033[0m")
 
 def main(args):
     if len(args) < 2 or args[1] in ["help","--help","-h"]:
@@ -2265,92 +2138,7 @@ def main(args):
         print("Verification result = ",
               verifier.verify(receiptData, receiptSigData))
 
-    # elif args[1] in ["server", "client"]:
-    #     bankAddr = PlaygroundAddress.FromString(args[2])
-    #     chaperoneAddr = args[3]
-    #     runner = PlaygroundNode(bankAddr, chaperoneAddr, 9090, standAlone=True)
-    #     bankModule = PlaygroundNodeControl()
-    #     args = [args[1]]+args[4:]
-    #     tasks = []
-    #     tasks.append(StandaloneTask(runner.startScript, [bankModule, args]))
-    #     if args[1] == "client":
-    #         tasks.append(StandaloneTask(lambda: stdio.StandardIO(bankModule.getStdioProtocol()),[]))
-    #     runner.startLoop(*tasks)
-
-        """
-        if len(args) == 4 and args[2] == "-f":
-            if not os.path.exists(args[3]):
-                sys.exit("No such config file %s")
-            configOptions = LoadOptions(args[3])
-            serverData = configOptions.getSection("bank.server")
-            passwordFile = serverData["online_password_file"]
-            bankPath = serverData["bank_path"]
-            certPath = serverData["cert_path"]
-            playgroundAddr = serverData["playground_server"]
-            playgroundPort = serverData["playground_tcp_port"]
-            connectionType = serverData["connection_type"]
-        else:
-            if len(args) != 8:
-                sys.exit(USAGE)
-            passwordFile, bankPath, certPath, playgroundAddr, playgroundPort, connectionType = args[2:]
-        playgroundPort = int(playgroundPort)
-        if not os.path.exists(passwordFile):
-            sys.exit("Could not locate passwordFile " + passwordFile)
-        if not os.path.exists(certPath):
-            sys.exit("Could not locate cert file " + certPath)
-        with open(certPath) as f:
-            cert = X509Certificate.loadPEM(f.read())
-        ledgerPassword = getpass.getpass("Enter bank password:")
-        bank = Ledger(bankPath, cert, ledgerPassword)
-        bankServer = PlaygroundOnlineBank(passwordFile, bank)
-        client = playground.network.client.ClientBase(BANK_FIXED_PLAYGROUND_ADDR)
-        client.listen(bankServer, BANK_FIXED_PLAYGROUND_PORT, connectionType=connectionType)
-        
-        logctx = LoggingContext()
-        logctx.nodeId = "onlinebank_"+BANK_FIXED_PLAYGROUND_ADDR.toString()
-        #logctx.doPacketTracing = True
-        playground.playgroundlog.startLogging(logctx)
-        
-        client.connectToChaperone(playgroundAddr, playgroundPort)
-    elif args[1] == "client_cli":
-        if len(args) == 4 and args[2] == "-f":
-            if not os.path.exists(args[3]):
-                sys.exit("No such config file %s")
-            configOptions = LoadOptions(args[3])
-            clientData = configOptions.getSection("bank.client_cli")
-            loginName = clientData["login_name"]
-            certPath = clientData["cert_path"]
-            clientAddrString = clientData["address"]
-            playgroundAddr = clientData["playground_server"]
-            playgroundPort = clientData["playground_tcp_port"]
-            connectionType = clientData["connection_type"]
-        else:
-            sys.exit(USAGE)
-        playgroundPort = int(playgroundPort)
-        with open(certPath) as f:
-            cert = X509Certificate.loadPEM(f.read())
-        #client = playground.network.client.ClientBase(playground.network.common.PlaygroundAddress(20151, 0, 1, 999))
-        clientAddr = playground.network.common.PlaygroundAddress.FromString(clientAddrString)
-        client = playground.network.client.ClientBase(clientAddr)
-        passwd = getpass.getpass("Enter bank account password for %s: "%loginName)
-        clientFactory = PlaygroundOnlineBankClient(cert, loginName, passwd)
-        #delayedConnect = lambda: client.connect(clientFactory, BANK_FIXED_PLAYGROUND_ADDR, BANK_FIXED_PLAYGROUND_PORT, connectionType=connectionType)
-        delayedCLI = lambda: stdio.StandardIO(AdminBankCLIClient(client, 
-                                                                 clientFactory, 
-                                                                 BANK_FIXED_PLAYGROUND_ADDR, 
-                                                                 connectionType))
-        
-        logctx = LoggingContext()
-        logctx.nodeId = "client_cli"
-        #logctx.doPacketTracing = True
-        playground.playgroundlog.startLogging(logctx)
-        
-        client.runWhenConnected(delayedCLI)
-        client.connectToChaperone(playgroundAddr, playgroundPort)"""
-
     elif args[1] == "server":
-        # bankAddr = BANK_FIXED_PLAYGROUND_ADDR #PlaygroundAddress.FromString(args[2])
-        # chaperoneAddr = args[3]
         control = PlaygroundNodeControl()
         args = args[1:]
         success, reason = control.start(args)
@@ -2360,7 +2148,6 @@ def main(args):
     elif args[1] == "client":
         control = PlaygroundNodeControl()
         args = args[1:]
-        print(args)
         success, reason = control.start(args)
         if not success:
             print(reason)
@@ -2370,4 +2157,3 @@ def main(args):
 
 if __name__ == "__main__":
     main(args=sys.argv)
-    # main(["client", "20174.x.x.x", "certs/signed_certs/5001cert", "fadyuser"])

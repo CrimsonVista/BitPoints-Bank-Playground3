@@ -104,7 +104,6 @@ class SimplePacketHandler(PacketHandlerInterface):
             
     def handlePacket(self, protocol, pkt):
         pkt = PacketType.Deserialize(pkt)
-        print("[%s]" % (time.time()%1e4), "Received", pkt.DEFINITION_IDENTIFIER)
         version = pkt.DEFINITION_VERSION
         versionMajorString, versionMinorString = version.split(".")
         versionMajor = int(versionMajorString)

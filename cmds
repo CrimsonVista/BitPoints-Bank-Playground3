@@ -1,2 +1,7 @@
 account switch "Fady'sPEM"
-account deposit bitpoints.10.Wed_Nov_15_04_24_40_2017
+account current
+account balance
+account deposit bitpoints.10.Wed_Nov_15_23_20_37_2017
+account transfer VAULT 1 "Thanks for the fish"
+account withdraw 1
+account balance
