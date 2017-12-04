@@ -10,6 +10,15 @@ from AsyncIODeferred import Deferred
 from playground.network.common.Protocol import StackingProtocol
 
 class AdvancedStdio(object):
+    """
+    We need AdvancedStdio to do things like tab completion, etc.
+    Otherwise, we could just use asyncio's addreader
+
+    AdvancedStdio will run in a loop. When data is available, it
+    will it send it to the main thread asyncio loop. It also
+    functions as a transport allowing writes
+    """
+
     ReadlineModule = None
 
     def __init__(self, protocol):
@@ -58,7 +67,7 @@ class AdvancedStdio(object):
         self.lose_connection()
 
     def lose_connection(self):
-        self.__asyncLoop.call_later(0,self.__asyncLoop.stop)
+        #self.__asyncLoop.call_later(0,self.__asyncLoop.stop)
         with self.__quitLock:
             self.__quit = True
 
@@ -100,21 +109,24 @@ class AdvancedStdio(object):
         if isinstance(self.__protocol, CompleterInterface):
             readline.set_completer(self.__protocol.complete)
         readline.parse_and_bind("tab: complete")
-        self.__protocol.make_connection(self)
+        self.__asyncLoop.call_soon_threadsafe(self.__protocol.make_connection, self)
         with self.__getLineLock:
             self.__getLine = True
         while not self.shouldQuit():
             try:
                 with self.__inputLock:
                     line = input(self.__protocol.prompt)
-            except:
-                print("")
-                self.__asyncLoop.call_soon_threadsafe(self.__asyncLoop.stop)
-                return
+            except Exception as e:
+                print("[CLIShell:error]", e)
+                break
+                #self.__asyncLoop.call_soon_threadsafe(self.__asyncLoop.stop)
+                #self.__protocol.lose_connection()
+                #return
             with self.__getLineLock:
                 self.__getLine = False
             self.__asyncLoop.call_soon_threadsafe(self.__protocolProcessLine, line)
             self.__waitUntilReadyForInput()
+        self.__protocol.connection_lost()
 
 
 def FileArgCompleter(s, state):
