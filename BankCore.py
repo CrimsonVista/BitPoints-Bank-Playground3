@@ -341,7 +341,7 @@ class Ledger(PermanentObjectMixin):
         initialState = {"ledgerLine":initialLedger,
                         "ledgerDir":ledgerDir,
                         "vaultDir":vaultDir,
-                        "mintCertPaths":{}}
+                        "mintCertPaths":set()}
         if not os.path.exists(ledgerDir):
             os.mkdir(ledgerDir)
         if not os.path.exists(vaultDir):
@@ -355,7 +355,7 @@ class Ledger(PermanentObjectMixin):
         self.__dir = dbDirectory
         self.__cert = cert
         self.__password = password
-        self.__mintCertPaths = []
+        self.__mintCertPaths = set()
         self.__bpVerifiers = dict()
         self.__load()
         
@@ -384,7 +384,7 @@ class Ledger(PermanentObjectMixin):
         self.__bpVerifiers = dict()
         for path in self.__mintCertPaths:
             cert = loadCertFromFile(path)
-            issuer = getCertIssuer(cert)
+            issuer = bytes(getCertSubject(cert)["commonName"],"utf-8")
             self.__bpVerifiers[issuer] = BitPointVerifier(cert)
         self.__ledgerStorage = LedgerLineStorage(self.__ledgerDir, self.__cert, self.__password)
         self.__vault = BitPointVault(self.__vaultDir, self.__cert, self.__password)
@@ -413,8 +413,9 @@ class Ledger(PermanentObjectMixin):
     def registerMintCert(self, certpath):
         try:
             certObj = loadCertFromFile(certpath)
-            issuer = bytes(certObj.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "utf-8")
+            issuer = bytes(getCertSubject(certObj)["commonName"], "utf-8")
             self.__bpVerifiers[issuer] = BitPointVerifier(certObj)
+            self.__mintCertPaths.add(certpath)
             self.__save()
         except Exception:
             errMsg = traceback.format_exc()
@@ -467,7 +468,7 @@ class Ledger(PermanentObjectMixin):
         #if 1:
         for bitPoint in bitPoints:
             if bitPoint.issuer() not in self.__bpVerifiers:
-                return LedgerOperationFailure("Cannot verify bitpoint. Unknown issuer %s" % bitPoint.issuer())
+                return LedgerOperationFailure("Cannot verify bitpoint. Unknown issuer %s (known issuers: %s)" % (bitPoint.issuer(),self.__bpVerifiers.keys()))
             result, errMsg = self.__bpVerifiers[bitPoint.issuer()].verify(bitPoint)
             if not result:
                 return LedgerOperationFailure(
