@@ -577,10 +577,11 @@ def main(BankCoreModule, args):
         for account in bank.getAccounts():
             print("%s balance"%account, bank.getBalance(account))
     elif args[0] == "register_mint":
-        certpath, path = args[1:3]
+        bankcertpath, path, mintcertpath = args[1:4]
         passwd = getpass()
-        bank = Ledger(path, cert, passwd)
-        result = bank.registerMintCert(certpath)
+        bankcert = loadCertFromFile(bankcertpath)
+        bank = Ledger(path, bankcert, passwd)
+        result = bank.registerMintCert(mintcertpath)
         if not isinstance(result, LedgerOperationSuccess):
             print("Could not load certificate", result.msg())
         else:
