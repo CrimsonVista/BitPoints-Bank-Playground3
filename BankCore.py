@@ -354,9 +354,9 @@ class Ledger(PermanentObjectMixin):
         self.__dir = dbDirectory
         self.__cert = cert
         self.__password = password
-        self.__load()
         self.__mintCerts = {}
         self.__bpVerifiers = {}
+        self.__load()
         
     def __nextLedgerLine(self):
         old = self.__ledgerLine
@@ -370,7 +370,7 @@ class Ledger(PermanentObjectMixin):
     def __save(self):
         abspath = os.path.join(self.__dir, self.CRYPTO_CONTROL_FILE_NAME)
         self.secureSaveState(abspath, self.__cert, self.__privateKey, self.__password, ledgerLine=self.__ledgerLine,
-                             ledgerDir=self.__ledgerDir, vaultDir=self.__vaultDir)
+                             ledgerDir=self.__ledgerDir, vaultDir=self.__vaultDir, bpVerifs=self.__bpVerifiers)
         
     def __load(self):
         abspath = os.path.join(self.__dir, self.CRYPTO_CONTROL_FILE_NAME)
@@ -379,6 +379,7 @@ class Ledger(PermanentObjectMixin):
         self.__privateKey, state = self.secureLoadState(abspath, self.__cert, self.__password)
         self.__ledgerDir = state["ledgerDir"]
         self.__vaultDir = state["vaultDir"]
+        self.__bpVerifiers = state["bpVerifs"]
         self.__ledgerStorage = LedgerLineStorage(self.__ledgerDir, self.__cert, self.__password)
         self.__vault = BitPointVault(self.__vaultDir, self.__cert, self.__password)
         self.__ledgerLine = state["ledgerLine"]
@@ -408,6 +409,7 @@ class Ledger(PermanentObjectMixin):
             issuer = bytes(certObj.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "utf-8")
             self.__mintCerts[issuer] = certObj
             self.__bpVerifiers[issuer] = BitPointVerifier(certObj)
+            self.__save()
         except Exception:
             errMsg = traceback.format_exc()
             return LedgerOperationFailure("Could not register cert for mint: %s" % errMsg)
@@ -567,16 +569,16 @@ def main(BankCoreModule, args):
         bank = BankCoreModule.Ledger(path, cert, passwd)
         for account in bank.getAccounts():
             print("%s balance"%account, bank.getBalance(account))
-    # elif args[0] == "register_mint":
-    #     cert, path = args[1:3]
-    #     cert = loadCertFromFile(cert)
-    #     passwd = getpass()
-    #     bank = BankCoreModule.Ledger(path, cert, passwd)
-    #     result = bank.registerMintCert(cert)
-    #     if not result.succeeded():
-    #         print("Could not load certificate", result.msg())
-    #     else:
-    #         print("Mint cert registration successful?")
+    elif args[0] == "register_mint":
+        cert, path = args[1:3]
+        cert = loadCertFromFile(cert)
+        passwd = getpass()
+        bank = Ledger(path, cert, passwd)
+        result = bank.registerMintCert(cert)
+        if not isinstance(result, LedgerOperationSuccess):
+            print("Could not load certificate", result.msg())
+        else:
+            print("Mint cert registration successful?")
     elif args[0] == "create_account":
         accountName, cert, path = args[1:4]
         cert = loadCertFromFile(cert)

@@ -1,7 +1,7 @@
 echo "This script DELETES several files presumed to be from previous tests."
-echo "Check you're not in an important directory before running this"
-read -r -p "Continue? [y/N] " response
-if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+echo "Check you are not in an important directory before running this"
+read -r -n 1 -p "Continue? [y/N]"
+if [ "$REPLY" = "y" ]
 then
 
 	# Clean up bitpoints files

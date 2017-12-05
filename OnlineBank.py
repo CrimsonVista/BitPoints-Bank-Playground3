@@ -454,7 +454,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             balancesList.append(self.__bank.getBalance(account))
         response = self.__createResponse(msgObj, AdminBalanceResponse)
         response.RequestId = msgObj.RequestId
-        response.Accounts = accountList
+        response.Accounts = list(accountList)
         response.Balances = balancesList
         self.__logSecure("Sending back %d balances" % len(balancesList))
         self.sendPacket(response)
