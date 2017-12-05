@@ -1845,8 +1845,7 @@ class PlaygroundNodeControl(object):
         self.bankServer = PlaygroundOnlineBank(passwordFile, bank)
         if len(serverArgs) == 4:
             mintCertFile = serverArgs[3]
-            cert = loadCertFromFile(mintCertFile)
-            result = bank.registerMintCert(cert)
+            result = bank.registerMintCert(mintCertFile)
             if not result.succeeded():
                 print("Could not load certificate", result.msg())
 

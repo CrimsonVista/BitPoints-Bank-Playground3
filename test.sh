@@ -26,7 +26,7 @@ then
 	echo =================== PrintingPress mint ===================
 	python3 PrintingPress.py mint 10:10 $certPath mint2
 
-	bitpointsfile="$(ls | grep bitpoints)"
+	bitpointsfile="$(ls | grep bitpoints | head -1)"
 
 	echo =================== PrintingPress info ===================
 	python3 PrintingPress.py info $bitpointsfile

@@ -340,7 +340,8 @@ class Ledger(PermanentObjectMixin):
         vaultDir = os.path.join(path, "vault")
         initialState = {"ledgerLine":initialLedger,
                         "ledgerDir":ledgerDir,
-                        "vaultDir":vaultDir}
+                        "vaultDir":vaultDir,
+                        "mintCertPaths":{}}
         if not os.path.exists(ledgerDir):
             os.mkdir(ledgerDir)
         if not os.path.exists(vaultDir):
@@ -354,8 +355,8 @@ class Ledger(PermanentObjectMixin):
         self.__dir = dbDirectory
         self.__cert = cert
         self.__password = password
-        self.__mintCerts = {}
-        self.__bpVerifiers = {}
+        self.__mintCertPaths = []
+        self.__bpVerifiers = dict()
         self.__load()
         
     def __nextLedgerLine(self):
@@ -370,7 +371,7 @@ class Ledger(PermanentObjectMixin):
     def __save(self):
         abspath = os.path.join(self.__dir, self.CRYPTO_CONTROL_FILE_NAME)
         self.secureSaveState(abspath, self.__cert, self.__privateKey, self.__password, ledgerLine=self.__ledgerLine,
-                             ledgerDir=self.__ledgerDir, vaultDir=self.__vaultDir, bpVerifs=self.__bpVerifiers)
+                             ledgerDir=self.__ledgerDir, vaultDir=self.__vaultDir, mintCertPaths=self.__mintCertPaths)
         
     def __load(self):
         abspath = os.path.join(self.__dir, self.CRYPTO_CONTROL_FILE_NAME)
@@ -379,7 +380,12 @@ class Ledger(PermanentObjectMixin):
         self.__privateKey, state = self.secureLoadState(abspath, self.__cert, self.__password)
         self.__ledgerDir = state["ledgerDir"]
         self.__vaultDir = state["vaultDir"]
-        self.__bpVerifiers = state["bpVerifs"]
+        self.__mintCertPaths = state["mintCertPaths"]
+        self.__bpVerifiers = dict()
+        for path in self.__mintCertPaths:
+            cert = loadCertFromFile(path)
+            issuer = getCertIssuer(cert)
+            self.__bpVerifiers[issuer] = BitPointVerifier(cert)
         self.__ledgerStorage = LedgerLineStorage(self.__ledgerDir, self.__cert, self.__password)
         self.__vault = BitPointVault(self.__vaultDir, self.__cert, self.__password)
         self.__ledgerLine = state["ledgerLine"]
@@ -404,10 +410,10 @@ class Ledger(PermanentObjectMixin):
     def __reconcileCirculation(self):
         return self.__ledgerLine.getBalance("CIRCULATION") == (-len(self.__vault.keys()))
     
-    def registerMintCert(self, certObj):
+    def registerMintCert(self, certpath):
         try:
+            certObj = loadCertFromFile(certpath)
             issuer = bytes(certObj.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value, "utf-8")
-            self.__mintCerts[issuer] = certObj
             self.__bpVerifiers[issuer] = BitPointVerifier(certObj)
             self.__save()
         except Exception:
@@ -426,14 +432,14 @@ class Ledger(PermanentObjectMixin):
             return LedgerOperationFailure("Not enough BitPoints in account %s to withdraw %d" % (account, amount))
         bitpointKeys = self.__vault.keys()[:amount]
         if len(bitpointKeys) < amount:
-            return LedgerOperationFailure("Not enough Bitpoints in the vault for withdrawl")
+            return LedgerOperationFailure("Not enough Bitpoints in the vault for withdrawal")
         bitpoints = []
         for bitpointKey in bitpointKeys:
             bitpoints.append(self.__vault.get(bitpointKey))
         result = self.__vault.remove(bitpoints)
         if not result.succeeded():
             return result
-        self.__ledgerLine.setTransaction(time.asctime(), "cash withdrawl", (account, "CIRCULATION", amount))
+        self.__ledgerLine.setTransaction(time.asctime(), "cash withdrawal", (account, "CIRCULATION", amount))
         self.__nextLedgerLine()
         self.__save()
         commit = self.__vault.commitRemove()
@@ -570,11 +576,10 @@ def main(BankCoreModule, args):
         for account in bank.getAccounts():
             print("%s balance"%account, bank.getBalance(account))
     elif args[0] == "register_mint":
-        cert, path = args[1:3]
-        cert = loadCertFromFile(cert)
+        certpath, path = args[1:3]
         passwd = getpass()
         bank = Ledger(path, cert, passwd)
-        result = bank.registerMintCert(cert)
+        result = bank.registerMintCert(certpath)
         if not isinstance(result, LedgerOperationSuccess):
             print("Could not load certificate", result.msg())
         else:
@@ -650,7 +655,7 @@ def full_test(args):
     try:
         Ledger.InitializeDb(path, fakeCert, key, passwd)
     except Exception as e:
-        print("Wrong combination of cert and key caught! (%s)" % e)
+        print("Wrong combination of cert and key caught correctly! (%s)" % e)
 
     # Create a db
     Ledger.InitializeDb(path, cert, key, passwd)
@@ -659,13 +664,13 @@ def full_test(args):
     try:
         Ledger(path, cert, fakePass)
     except ValueError as e:
-        print("Wrong password for this bank caught! (%s)" % e)
+        print("Wrong password for this bank caught correctly! (%s)" % e)
 
     # Attempt to load bank with wrong cert
     try:
         Ledger(path, fakeCert, passwd)
     except Exception as e:
-        print("Wrong certificate for this bank caught! (%s)" % e)
+        print("Wrong certificate for this bank caught correctly! (%s)" % e)
 
     # Correctly load bank
     bank = Ledger(path, cert, passwd)
@@ -714,7 +719,7 @@ def full_test(args):
     assert(isinstance(result, LedgerOperationSuccess))
 
     # Register a mint cert (in this case we'll just use the same one...)
-    result = bank.registerMintCert(cert)
+    result = bank.registerMintCert(certPath)
     assert(isinstance(result, LedgerOperationSuccess))
 
     # With that cert, we can deposit some BitPoints minted by that cert
@@ -741,11 +746,12 @@ def full_test(args):
         print("Receipt is forged")
 
     # Try to withdraw more BitPoints than the bank has
-    result = bank.withdrawCash("VAULT", 3)
+    result = bank.withdrawCash("VAULT", 9999999999)
     try:
         assert(isinstance(result, LedgerOperationSuccess))
+        raise(Exception("Over-withdrawal not caught!!!"))
     except AssertionError as e:
-        print("Over-withdrawl caught! (%s)" % result.msg())
+        print("Over-withdrawal caught correctly! (%s)" % result.msg())
 
     # Test LedgerLineSearch
     filter = lambda ledgerLine: ledgerLine.partOfTransaction("CIRCULATION")
