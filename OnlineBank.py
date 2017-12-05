@@ -1877,11 +1877,13 @@ class PlaygroundNodeControl(object):
 
         clientFactory = PlaygroundOnlineBankClient(cert, loginName, passwd)
 
+        loop = asyncio.get_event_loop()
+
         def initShell():
             uiFactory = AdminBankCLIClient(None, clientFactory, remoteAddress)
+            uiFactory.registerExitListener(lambda reason: loop.call_later(2.0, loop.stop))
             a = CLIShell.AdvancedStdio(uiFactory)
 
-        loop = asyncio.get_event_loop()
         # loop.set_debug(enabled=True)
         loop.call_soon(initShell)
         loop.run_forever()

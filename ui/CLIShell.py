@@ -126,7 +126,7 @@ class AdvancedStdio(object):
                 self.__getLine = False
             self.__asyncLoop.call_soon_threadsafe(self.__protocolProcessLine, line)
             self.__waitUntilReadyForInput()
-        self.__protocol.connection_lost()
+        self.__asyncLoop.call_soon_threadsafe(self.__protocol.connection_lost)
 
 
 def FileArgCompleter(s, state):
@@ -498,6 +498,14 @@ class CLIShell(LineReceiver, CompleterInterface):
         self.__registerCommand(self.__batchCmdHandler)
         self.__registerCommand(CLICommand("quit", "Terminate the shell", self.quit,
                                           mode=CLICommand.STANDARD_MODE))
+        self.__exitListeners = set([])
+
+    def registerExitListener(self, l):
+        self.__exitListeners.add(l)
+
+    def removeExitListener(self, l):
+        if l in self.__exitListeners:
+            self.__exitListeners.remove(l)
 
     def help(self, writer, cmd=None):
         if cmd:
@@ -597,6 +605,11 @@ class CLIShell(LineReceiver, CompleterInterface):
             self.transport.write("Unknown command %s\n" % cmd)
             return (False, None)
         return callbackHandler.process(cmdArgs, self.transport.write)
+
+    def connection_lost(self, reason=None):
+        super().connection_lost(reason)
+        for exitListener in self.__exitListeners:
+            asyncio.get_event_loop().call_soon(exitListener, reason)
 
 DEBUG = False
 def debugPrint(*s):
