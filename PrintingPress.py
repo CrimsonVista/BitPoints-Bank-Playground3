@@ -195,12 +195,14 @@ def main(args):
             bitpoints = BitPoint.deserializeAll(f)
         cert = loadCertFromFile(issuingCert)
         verifier = BitPointVerifier(cert)
+        numValid = 0
         for bp in bitpoints:
             isValid, reason = verifier.verify(bp)
             if isValid:
-                print(bp.serialNumber(),"is valid")
+                numValid += 1
             else:
                 print(bp.serialNumber(),"is NOT valid:", reason)
-        
+        print("Valid bitpoints: %s/%s" % (numValid, len(bitpoints)))
+
 if __name__ == "__main__":
     main(sys.argv[1:])
