@@ -34,10 +34,10 @@ PasswordHash = lambda pw: PasswordBytesHash(bytes(pw, "utf-8"))
 
 # TODO: Configurations
 DEBUG = True
-BANK_FIXED_PLAYGROUND_ADDR = PlaygroundAddress(20174, 1337, 1337, 1)
+BANK_FIXED_PLAYGROUND_ADDR = PlaygroundAddress(20174, 1, 1337, 1)
 BANK_FIXED_PLAYGROUND_PORT = 700
 # The playground address network (XXXX.___.XXXX.XXXX) allowed
-ADMIN_ZONE = 1337
+ADMIN_ZONE = 1
 
 def callLater(delay, func):
     asyncio.get_event_loop().call_later(delay, func)
@@ -244,7 +244,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if not peer: return False
         addr = PlaygroundAddress.FromString(peer[0])
         # Uhhh this is a weird check...
-        if addr[1] != ADMIN_ZONE: return False
+        #if addr[1] != ADMIN_ZONE: return False
         return True
 
     def __getAdminPermissions(self, requestId=0, fatal=True):
