@@ -1412,7 +1412,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
 
             loop = self.__asyncLoop
             debugPrint("CLI Making a client connection...")
-            coro = playground.getConnector().create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, BANK_FIXED_PLAYGROUND_PORT)
+            coro = playground.getConnector(self.__bankClientFactory.stack).create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, BANK_FIXED_PLAYGROUND_PORT)
             debugPrint("CLI Running client protocol coroutine...")
             fut = asyncio.run_coroutine_threadsafe(coro, self.__asyncLoop)
             fut.add_done_callback(self.__handleClientConnection)
@@ -1831,7 +1831,7 @@ class PlaygroundNodeControl(object):
             return (False, "Bank server requires " +
                             "passwordFile, bankPath, certPath, (optional: mintCert)")
 
-        passwordFile, bankPath, certPath = serverArgs[0:3]
+        stack, passwordFile, bankPath, certPath = serverArgs[0:4]
 
         if not os.path.exists(passwordFile):
             return (False, "Could not locate passwordFile " + passwordFile)
@@ -1851,7 +1851,7 @@ class PlaygroundNodeControl(object):
 
         loop = asyncio.get_event_loop()
         loop.set_debug(enabled=True)
-        coro = playground.getConnector().create_playground_server(self.bankServer.buildProtocol, BANK_FIXED_PLAYGROUND_PORT)
+        coro = playground.getConnector(stack).create_playground_server(self.bankServer.buildProtocol, BANK_FIXED_PLAYGROUND_PORT)
         server = loop.run_until_complete(coro)
         print("Bank Server Started at {}".format(server.sockets[0].gethostname()))
         print("To access start a bank client protocol to %s:%s" % (BANK_FIXED_PLAYGROUND_ADDR,BANK_FIXED_PLAYGROUND_PORT)) # TODO: change address to display the correct host Playground address
@@ -1861,8 +1861,8 @@ class PlaygroundNodeControl(object):
     
     def processClient(self, clientArgs):
         self.__mode = "client"
-        if len(clientArgs) == 3:
-            remoteAddress, certPath, loginName= clientArgs[0:3]
+        if len(clientArgs) == 4:
+            stack, remoteAddress, certPath, loginName= clientArgs[0:4]
         else:
             return (False, "Bank client CLI requires remote, address, certPath, and user loginName")
         if not os.path.exists(certPath):
@@ -1875,6 +1875,7 @@ class PlaygroundNodeControl(object):
         passwd = getpass.getpass("Enter bank account password for %s: "%loginName)
 
         clientFactory = PlaygroundOnlineBankClient(cert, loginName, passwd)
+        clientFactory.stack = stack # UGLY HACK TO FIX LATER
 
         loop = asyncio.get_event_loop()
 
