@@ -1827,7 +1827,7 @@ class PlaygroundNodeControl(object):
     
     def processServer(self, serverArgs):
         self.__mode = "server"
-        if len(serverArgs) not in [3,4]:
+        if len(serverArgs) not in [4,5]:
             return (False, "Bank server requires " +
                             "passwordFile, bankPath, certPath, (optional: mintCert)")
 
