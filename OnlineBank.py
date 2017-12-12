@@ -27,6 +27,9 @@ from playground.network.packet.PacketType import FIELD_NOT_SET
 import logging
 logger = logging.getLogger(__file__)
 
+from playground.common.logging import EnablePresetLogging, PRESET_VERBOSE
+EnablePresetLogging(PRESET_VERBOSE)
+
 RANDOM_u64 = lambda: int.from_bytes(os.urandom(8), "big")
 
 PasswordBytesHash = lambda pw: SHA(pw).digest()
@@ -150,7 +153,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         try:
             self.handlePacket(None, packet)
         except Exception as e:
-            print(traceback.format_exc())
+            logger.debug(traceback.format_exc())
         
     def __clearWithdrawlLimit(self, account):
         if account in self.__withdrawlTracking:
@@ -822,6 +825,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         debugPrint("server __handleClose", msg.DEFINITION_IDENTIFIER)
         msgObj = msg
         self.__logSecure("Close Connection")
+        if self.transport: self.transport.close()
         if self.__state != self.STATE_OPEN:
             return # silently ignore close messages on unopen connections
         if self.__connData["ClientNonce"] != msgObj.ClientNonce:
@@ -829,7 +833,6 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if self.__connData["ServerNonce"] != msgObj.ServerNonce:
             return # silently ignore close messages on wrong server nonce
         self.__state = self.STATE_UNINIT
-        if self.transport: self.transport.close()
         
         
 class BankClientProtocol(SimplePacketHandler, StackingProtocol):
@@ -918,7 +921,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             debugPrint("Received", PacketType.Deserialize(packet).DEFINITION_IDENTIFIER)
             self.handlePacket(None, packet)
         except Exception as e:
-            print(traceback.format_exc())
+            logger.debug(traceback.format_exc())
 
     def connection_lost(self, reason):
         #SimplePacketHandler.connection_lost(self, reason)
