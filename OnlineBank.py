@@ -25,7 +25,7 @@ from playground.network.common.PlaygroundAddress import PlaygroundAddress
 from playground.network.packet.PacketType import FIELD_NOT_SET
 
 import logging
-logger = logging.getLogger(__file__)
+logger = logging.getLogger("playground.apps."+__file__)
 
 from playground.common.logging import EnablePresetLogging, PRESET_VERBOSE
 EnablePresetLogging(PRESET_VERBOSE)
@@ -88,6 +88,12 @@ class DummyFile(object):
 InvalidPwFile = DummyFile()
 
 
+class ConnectionPod:
+    def __init__(self, peer, starttime):
+        self.peer = peer
+        self.starttime = starttime
+        self.lastactive = starttime
+
 class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
 
     STATE_UNINIT = "Uninitialized"
@@ -99,6 +105,8 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
     
     WITHDRAWAL_LIMIT = 1000
     WITHDRAWAL_WINDOW = 6*3600 # 6 hours in seconds
+
+    CURR_CONNECTIONS = {}
     
     def __logSecure(self, msg):
         fullMsg = "SERVER SECURITY (Session %(ClientNonce)d-%(ServerNonce)d"
@@ -138,16 +146,41 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         self.registerPacketHandler(LedgerRequest, self.__handleLedgerRequest)
         self.registerPacketHandler(Close, self.__handleClose)
 
+    def _maintenance(self):
+        if self in self.CURR_CONNECTIONS:
+            connPod = self.CURR_CONNECTIONS[self]
+            if (time.time()-connPod.lastactive) > 600: # Close the connection after 10 minutes of inactivity
+                logger.debug("Closing connection to {} because idle time out".format(self.transport.get_extra_info("peername")))
+                self.transport.close()
+            else:
+                asyncio.get_event_loop().call_later(300, self._maintenance)
+
     def connection_made(self, transport):
         debugPrint("server proto connection made", transport)
         StackingProtocol.connection_made(self, transport)
         self.transport = transport
+        peer = transport.get_extra_info("peername")
+        self.CURR_CONNECTIONS[self] = ConnectionPod(peer, time.time())
+        logger.debug("New bank server connection {}. Now has {} connections".format(peer, len(self.CURR_CONNECTIONS)))
+        for p in self.CURR_CONNECTIONS:
+            connPod = self.CURR_CONNECTIONS[p]
+            logger.debug("\t{} connected {} seconds, idle {} seconds".format(connPod.peer, time.time()-connPod.starttime, time.time()-connPod.lastactive))
+        self._maintenance()
+
+    def connection_lost(self, reason=None):
+        if self in self.CURR_CONNECTIONS:
+            logger.debug("Server connection lost to {}. Reason={}".format(self.CURR_CONNECTIONS[self].peer, reason))
+            del self.CURR_CONNECTIONS[self]
+        else: logger.debug("Server connection lost to unknown peer. Reason={}".format(reason))
+        logger.debug("{} connections remaining".format(len(self.CURR_CONNECTIONS)))
 
     def sendPacket(self, packet):
         self.transport.write(packet.__serialize__())
         debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
 
     def data_received(self, packet):
+        if self in self.CURR_CONNECTIONS:
+            self.CURR_CONNECTIONS[self].lastactive = time.time()
         debugPrint("server proto data_received")
         self.__logSecure("Received packet %s" % packet)
         try:
@@ -369,7 +402,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             accountToList = None
         else:
             accountToListAccess = self.__pwDb.currentAccess(self.__connData["LoginName"], accountToList)
-            if 'a' not in accountToListAccess:
+            if 'a' not in accountToListAccess and 'A' not in accountToListAccess:
                 self.__logSecure("List of users for account %s required 'a', but access is %s" % (accountToList, accountToListAccess))
                 return self.__sendPermissionDenied("Requires 'a' access", msgObj.RequestId)
 
@@ -1999,7 +2032,10 @@ class PasswordData(object):
     def __setUserAccess(self, userName, accountName, privilegeData):
         if userName not in self.__tmpUserTable:
             self.__tmpUserTable[userName] = {}
-        self.__tmpUserTable[userName][accountName] = privilegeData
+        if not privilegeData:
+            del self.__tmpUserTable[userName][accountName]
+        else:
+            self.__tmpUserTable[userName][accountName] = privilegeData
         
     def isValidAccessSpec(self, access, accountName):
         if accountName == self.ADMIN_ACCOUNT:
@@ -2055,9 +2091,9 @@ OnlineBank.py client <bank Playground addr> <cert> <user name>
 def getPasswordHashRoutine(currentPw=None):
     newPw = None
     oldPw = None
-    while currentPw != oldPw:
-        oldPw = getpass.getpass("ENTER CURRENT PASSWORD:")
-        oldPw = PasswordHash(oldPw)
+    #while currentPw != oldPw:
+    #    oldPw = getpass.getpass("ENTER CURRENT PASSWORD:")
+    #    oldPw = PasswordHash(oldPw)
     while newPw is None:
         newPw = getpass.getpass("Enter new password:")
         newPw2 = getpass.getpass("Re-enter new password:")
