@@ -37,7 +37,10 @@ from playground.network.packet.PacketType import FIELD_NOT_SET
 from playground.common.io.ui import CLIShell
 
 import logging
-logger = logging.getLogger(__file__)
+logger = logging.getLogger("playground.apps."+__file__)
+
+from playground.common.logging import EnablePresetLogging, PRESET_VERBOSE
+EnablePresetLogging(PRESET_VERBOSE)
 
 RANDOM_u64 = lambda: int.from_bytes(os.urandom(8), "big")
 
@@ -93,9 +96,6 @@ class DummyFile(object):
     def close(self): pass
 
 InvalidPwFile = DummyFile()
-
-
-
         
         
 class BankClientProtocol(SimplePacketHandler, StackingProtocol):
@@ -184,7 +184,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             debugPrint("Received", PacketType.Deserialize(packet).DEFINITION_IDENTIFIER)
             self.handlePacket(None, packet)
         except Exception as e:
-            print(traceback.format_exc())
+            logger.debug(traceback.format_exc())
 
     def connection_lost(self, reason):
         #SimplePacketHandler.connection_lost(self, reason)
@@ -1179,7 +1179,10 @@ class PasswordData(object):
     def __setUserAccess(self, userName, accountName, privilegeData):
         if userName not in self.__tmpUserTable:
             self.__tmpUserTable[userName] = {}
-        self.__tmpUserTable[userName][accountName] = privilegeData
+        if not privilegeData:
+            del self.__tmpUserTable[userName][accountName]
+        else:
+            self.__tmpUserTable[userName][accountName] = privilegeData
         
     def isValidAccessSpec(self, access, accountName):
         if accountName == self.ADMIN_ACCOUNT:
@@ -1235,9 +1238,9 @@ OnlineBank.py client <bank Playground addr> <cert> <user name>
 def getPasswordHashRoutine(currentPw=None):
     newPw = None
     oldPw = None
-    while currentPw != oldPw:
-        oldPw = getpass.getpass("ENTER CURRENT PASSWORD:")
-        oldPw = PasswordHash(oldPw)
+    #while currentPw != oldPw:
+    #    oldPw = getpass.getpass("ENTER CURRENT PASSWORD:")
+    #    oldPw = PasswordHash(oldPw)
     while newPw is None:
         newPw = getpass.getpass("Enter new password:")
         newPw2 = getpass.getpass("Re-enter new password:")
