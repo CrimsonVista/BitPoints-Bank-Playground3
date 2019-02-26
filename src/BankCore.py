@@ -190,6 +190,7 @@ class SecureItemStorage(PermanentObjectMixin):
         abspath = os.path.join(path, cls.CONTROL_FILE)
         dbAbsPath = os.path.join(path, cls.DB_FILE)
         # we have to cut off the .db because it is auto appended
+        print("path",dbAbsPath)
         db = dbm.open(dbAbsPath, "n")
         db.close()
         with open(dbAbsPath, "rb") as f:

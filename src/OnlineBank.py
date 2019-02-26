@@ -4,25 +4,37 @@ Created on Mar 27, 2014
 @author: sethjn
 '''
 
-import sys, os, getpass, shelve, time, traceback, datetime, asyncio
+import sys, os, getpass, shelve, time, traceback, stat
+import datetime, asyncio, argparse, configparser, shutil
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
 # from contextlib import closing
 
 from BankMessages import *
 from Exchange import BitPoint
 
-from BankCore import Ledger, LedgerLine # For unshelving
+from BankCore import LedgerOperationSuccess, Ledger, LedgerLine # For unshelving
 from AsyncIODeferred import Deferred
 
+from BankServerProtocol import BankServerProtocol
+from PrintingPress import PrintingPress, DefaultSerializer
+
 # TODO: Change to match actual playground layout (gotta push these too)
-from CipherUtil import SHA, loadCertFromFile, RSA_SIGNATURE_MAC
-from ui import CLIShell
-from network.common import ErrorHandler
-from network.common.PacketHandler import SimplePacketHandler
+from CipherUtil import SHA, loadCertFromFile, loadPrivateKeyFromPemFile, RSA_SIGNATURE_MAC
+from ErrorHandler import ErrorHandler
+from PacketHandler import SimplePacketHandler
 
 import playground
+from playground import Configure
 from playground.network.common.Protocol import StackingProtocol
 from playground.network.common.PlaygroundAddress import PlaygroundAddress
 from playground.network.packet.PacketType import FIELD_NOT_SET
+from playground.common.io.ui import CLIShell
 
 import logging
 logger = logging.getLogger(__file__)
@@ -34,9 +46,7 @@ PasswordHash = lambda pw: PasswordBytesHash(bytes(pw, "utf-8"))
 
 # TODO: Configurations
 DEBUG = True
-BANK_FIXED_PLAYGROUND_ADDR = PlaygroundAddress(20174, 1, 1337, 1)
-BANK_FIXED_PLAYGROUND_PORT = 700
-# The playground address network (XXXX.___.XXXX.XXXX) allowed
+
 ADMIN_ZONE = 1
 
 def callLater(delay, func):
@@ -85,751 +95,7 @@ class DummyFile(object):
 InvalidPwFile = DummyFile()
 
 
-class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
 
-    STATE_UNINIT = "Uninitialized"
-    STATE_OPEN = "Open"
-    STATE_ERROR = "Error"
-    
-    ADMIN_PW_ACCOUNT = "__admin__"
-    ADMIN_ACCOUNTS = ["VAULT"]
-    
-    WITHDRAWAL_LIMIT = 1000
-    WITHDRAWAL_WINDOW = 6*3600 # 6 hours in seconds
-    
-    def __logSecure(self, msg):
-        fullMsg = "SERVER SECURITY (Session %(ClientNonce)d-%(ServerNonce)d"
-        fullMsg += " User [%(LoginName)s] Account [%(AccountName)s] "
-        fullMsg = fullMsg % self.__connData
-        peer = self.transport and self.transport.get_extra_info("peername") or "<NOT CONNECTED>"
-        fullMsg += " Peer [%s]): " % (peer,)
-        fullMsg += msg
-        logSecure(fullMsg)
-    
-    def __init__(self, pwDb, bank):
-        debugPrint("server proto init")
-        SimplePacketHandler.__init__(self)
-        #self.setHandler(self)
-        self.__pwDb = pwDb
-        self.__connData = {"ClientNonce":0,
-                           "ServerNonce":0,
-                           "AccountName":None,
-                           "LoginName":None}
-        self.__state = self.STATE_UNINIT
-        self.__bank = bank
-        self.__withdrawlTracking = {}
-        self.registerPacketHandler(OpenSession, self.__handleOpenSession)
-        self.registerPacketHandler(ListAccounts, self.__handleListAccounts)
-        self.registerPacketHandler(ListUsers, self.__handleListUsers)
-        self.registerPacketHandler(CurrentAccount, self.__handleCurrentAccount)
-        self.registerPacketHandler(SwitchAccount, self.__handleSwitchAccount)
-        self.registerPacketHandler(BalanceRequest, self.__handleBalanceRequest)
-        self.registerPacketHandler(TransferRequest, self.__handleTransferRequest)
-        self.registerPacketHandler(DepositRequest, self.__handleDeposit)
-        self.registerPacketHandler(WithdrawalRequest, self.__handleWithdrawal)
-        self.registerPacketHandler(AdminBalanceRequest, self.__handleAdminBalanceRequest)
-        self.registerPacketHandler(CreateAccountRequest, self.__handleCreateAccount)
-        self.registerPacketHandler(SetUserPasswordRequest, self.__handleSetUserPassword)
-        self.registerPacketHandler(ChangeAccessRequest, self.__handleChangeAccess)
-        self.registerPacketHandler(CurAccessRequest, self.__handleCurAccess)
-        self.registerPacketHandler(LedgerRequest, self.__handleLedgerRequest)
-        self.registerPacketHandler(Close, self.__handleClose)
-
-    def connection_made(self, transport):
-        debugPrint("server proto connection made", transport)
-        StackingProtocol.connection_made(self, transport)
-        self.transport = transport
-
-    def sendPacket(self, packet):
-        self.transport.write(packet.__serialize__())
-        debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
-
-    def data_received(self, packet):
-        debugPrint("server proto data_received")
-        self.__logSecure("Received packet %s" % packet)
-        try:
-            self.handlePacket(None, packet)
-        except Exception as e:
-            print(traceback.format_exc())
-        
-    def __clearWithdrawlLimit(self, account):
-        if account in self.__withdrawlTracking:
-            del self.__withdrawlTracking[account]
-    
-    # def handleError(self, message, reporter=None, stackHack=0):
-    #     self.__logSecure("Error Reported %s" % message )
-    #     # handleError handles error messages reported in the framework
-    #     # this is different from __error, which is designed to handle
-    #     # errors in the protocol
-    #     self.g_ErrorHandler.handleError(message, reporter, stackHack)
-    
-    # def handleException(self, e, reporter=None, stackHack=0, fatal=False):
-    #     # handle if it's reported by us, or by one of our methods
-    #     localHandler = (reporter == self or (hasattr(reporter,"im_self") and reporter.im_self==self))
-    #     if not localHandler:
-    #         self.g_ErrorHandler.handleException(e, reporter, stackHack, fatal)
-    #         return
-    #
-    #     # this is an exception handler for exceptions raised by the framework
-    #     errMsg = "Error reported in handler %s\n" % str(reporter)
-    #     errMsg += traceback.format_exc()
-    #     # we will treat exceptions as fatal. Try to shut down
-    #     try:
-    #         networkErrorMessage = ServerError()
-    #         networkErrorMessage.ErrorMessage = errMsg
-    #         self.transport.write(networkErrorMessage)
-    #         self.handleError(errMsg)
-    #     except Exception:
-    #         self.handleError("Failed to transmit message: " + errMsg)
-    #         self.handleError(traceback.format_exc())
-    #     try:
-    #         callLater(0, self.transport.close)
-    #     except:
-    #         pass
-    
-    def __error(self, errMsg, requestId = 0, fatal=True):
-        debugPrint("server proto error ", errMsg)
-        self.__logSecure(errMsg)
-        if self.__state == self.STATE_ERROR:
-            return None
-        if self.__state == self.STATE_UNINIT:
-            response = LoginFailure()
-            response.ClientNonce = self.__connData["ClientNonce"]
-        else:
-            response = RequestFailure()
-            response.ClientNonce = self.__connData["ClientNonce"]
-            response.ServerNonce = self.__connData["ServerNonce"]
-            response.RequestId = requestId
-        response.ErrorMessage = errMsg
-        self.sendPacket(response)
-        if fatal:
-            debugPrint("server proto error Closing connection!")
-            self.__state = self.STATE_ERROR
-            callLater(1, self.transport.close)
-        return None
-    
-    def __sendPermissionDenied(self, errMsg, requestId=0):
-        if self.__state == self.STATE_ERROR:
-            return None
-        self.__logSecure("Permission denied, %s" % errMsg)
-        response = PermissionDenied()
-        response.ClientNonce = self.__connData.get("ClientNonce",0)
-        response.ServerNonce = self.__connData.get("ServerNonce",0)
-        response.RequestId = requestId
-        response.ErrorMessage = errMsg
-        self.sendPacket(response)
-        return None
-    
-    def __getSessionAccount(self, msgObj):
-        if self.__state != self.STATE_OPEN:
-            self.__error("Session not logged-in", msgObj.RequestId)
-            return None, None
-        if self.__connData["ClientNonce"] != msgObj.ClientNonce:
-            self.__error("Invalid connection data", msgObj.RequestId)
-            return None, None
-        if self.__connData["ServerNonce"] != msgObj.ServerNonce:
-            self.__error("Invalid connection data", msgObj.RequestId)
-            return None, None
-        account = self.__connData["AccountName"]
-        userName = self.__connData["LoginName"]
-        if account and self.__pwDb.hasAccount(account):
-            access = self.__pwDb.currentAccess(userName, account)
-        else: access = ''
-        debugPrint("server __getSessionAccount acc:", account, "access:", access)
-        return (account, access)
-    
-    def __validateAdminPeerConnection(self):
-        peer = self.transport.get_extra_info("peername")
-        debugPrint("Server's Peer:", peer)
-        if not peer: return False
-        addr = PlaygroundAddress.FromString(peer[0])
-        # Uhhh this is a weird check...
-        #if addr[1] != ADMIN_ZONE: return False
-        return True
-
-    def __getAdminPermissions(self, requestId=0, fatal=True):
-        if not self.__validateAdminPeerConnection():
-            if fatal: self.__error("Unauthorized connection location. Will be logged", requestId)
-            return None
-        userName = self.__connData.get("LoginName",None)
-        if not userName:
-            if fatal: self.__error("Attempt for admin without logging in. Will be logged", requestId)
-            return None
-        if not self.__pwDb.hasUser(userName):
-            if fatal: self.__error("Attempt for admin from not user. Will be logged", requestId)
-            return None
-        access = self.__pwDb.currentAccess(userName, self.ADMIN_PW_ACCOUNT)
-        if not access:
-            if fatal: self.__error("Attempt for admin without any admin permissions. Will be logged", requestId)
-            return None
-        return access
-    
-    """def __getAdminAccount(self, msgObj):
-        if not self.__validateAdminPeerConnection():
-            self.__error("Unauthorized connection location. Will be logged", msgObj.RequestId)
-            return None
-        account = self.__getSessionAccount(msgObj)
-        if account != self.ADMIN_PW_ACCOUNT:
-            self.__error("Unauthorized account", msgObj.RequestId)
-            return None
-        return account"""
-    
-    def __createResponse(self, msgObj, responseType):
-        response = responseType()
-        response.ClientNonce = msgObj.ClientNonce
-        response.ServerNonce = msgObj.ServerNonce
-        return response
-    
-    def __handleOpenSession(self, protocol, msg):
-        # permissions: None
-        if self.__state != self.STATE_UNINIT:
-            return self.__error("Session not uninitialized. State %s" % self.__state)
-        msgObj = msg
-        self.__connData["ClientNonce"] = msgObj.ClientNonce
-        if not self.__pwDb.hasUser(msgObj.Login):
-            debugPrint("server proto __handleOpenSession pw not equal")
-            return self.__error("Invalid Login. User does not exist or password is wrong")
-        passwordHash = self.__pwDb.currentUserPassword(msgObj.Login)
-        # debugPrint(passwordHash, len(passwordHash), type(passwordHash), "VS", msgObj.PasswordHash, len(msgObj.PasswordHash), type(msgObj.PasswordHash))
-        if passwordHash != eval(msgObj.PasswordHash):
-            debugPrint("server proto __handleOpenSession pw not equal")
-            return self.__error("Invalid Login. User does not exist or password is wrong")
-        """if not  accountName in self.__bank.getAccounts():
-            return self.__error("Invalid Login")"""
-        self.__connData["ServerNonce"] = RANDOM_u64()
-        self.__connData["AccountName"] = ""
-        self.__connData["LoginName"] = msgObj.Login
-        self.__state = self.STATE_OPEN
-        response = SessionOpen()
-        response.ClientNonce = msgObj.ClientNonce
-        response.ServerNonce = self.__connData["ServerNonce"]
-        response.Account = ""
-        self.__logSecure("Request for open with nonce %d, sending back %d" % (msgObj.ClientNonce,
-                                                                              self.__connData["ServerNonce"]))
-        self.sendPacket(response)
-        
-    def __handleCurrentAccount(self, protocol, msg):
-        # permissions: None
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if account is None: # require
-            return 
-        response = self.__createResponse(msgObj, CurrentAccountResponse)
-        response.Account = account
-        response.RequestId = msgObj.RequestId
-        self.sendPacket(response)
-        
-    def __handleListAccounts(self, protocol, msg):
-        # permissions: regular - None, for a specific user, Admin(B)
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if account is None:
-            return
-        if msgObj.User != FIELD_NOT_SET:
-            adminAccessData = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccessData is None:
-                # error already reported.
-                return None
-            if "B" not in adminAccessData:
-                self.__logSecure("Trying to list accounts for %s requires 'B' access, but has %s" % (msgObj.User, adminAccessData))
-                return self.__sendPermissionDenied("Requires 'B' access", msgObj.RequestId)
-            userName = msgObj.User
-        else:
-            userName = self.__connData["LoginName"]
-        accountAccessData = self.__pwDb.currentAccess(userName)
-        accountNames = list(accountAccessData.keys())
-        response = self.__createResponse(msgObj, ListAccountsResponse)
-        response.RequestId = msgObj.RequestId
-        response.Accounts = accountNames
-        self.sendPacket(response)
-        
-    def __handleListUsers(self, protocol, msg):
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        users = []
-        if account is None:
-            return
-        if msgObj.Account == FIELD_NOT_SET:
-            # use current account, unless account is not set, in which case
-            # it has to be administrator
-            accountToList = account
-        else:
-            accountToList = msgObj.Account
-        self.__logSecure("list users requested for account %s" % accountToList)
-            
-        if accountToList == '':
-            adminAccessData = self.__getAdminPermissions(msgObj.RequestId)
-            self.__logSecure("List of all users required admin access")
-            if adminAccessData is None:
-                # error already reported
-                return None
-            accountToList = None
-        else:
-            accountToListAccess = self.__pwDb.currentAccess(self.__connData["LoginName"], accountToList)
-            if 'a' not in accountToListAccess:
-                self.__logSecure("List of users for account %s required 'a', but access is %s" % (accountToList, accountToListAccess))
-                return self.__sendPermissionDenied("Requires 'a' access", msgObj.RequestId)
-
-        for name in self.__pwDb.iterateUsers(accountToList):
-            users.append(name)
-        response = self.__createResponse(msgObj, ListUsersResponse)
-        response.RequestId = msgObj.RequestId
-        response.Users = users
-        self.__logSecure("sending list of %d users" % len(users))
-        self.sendPacket(response)
-        
-    def __handleSwitchAccount(self, protocol, msg):
-        # permissions: some permissions on account, if an admin account, 'S'
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if account is None:
-            return
-        desiredAccount = msgObj.Account
-        
-        result = True
-        if desiredAccount.startswith("__"):
-            self.__logSecure("ATTEMPT TO ACCESS SPECIAL ACCOUNT %s" % desiredAccount)
-            result = False
-        elif desiredAccount in self.ADMIN_ACCOUNTS:
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess is None:
-                self.__logSecure("ATTEMPT TO ACCESS ADMIN ACCOUNT %s" % desiredAccount)
-                return
-            if 'S' not in adminAccess:
-                self.__logSecure("ATTEMPT TO ACCESS ADMIN ACCOUNT %s WITHOUT 'S' in %s" % (desiredAccount, adminAccess))
-                return self.__sendPermissionDenied("Requires 'S' permissions", msgObj.RequestId)
-        elif desiredAccount:
-            access = self.__pwDb.currentAccess(self.__connData["LoginName"], desiredAccount)
-            if not access:
-                self.__logSecure("Attempt to switch to %s, but no access" % desiredAccount) 
-                result = False
-        if result:
-            self.__connData["AccountName"] = desiredAccount
-            self.__logSecure("Account Switched")
-        if result:
-            response = self.__createResponse(msgObj, RequestSucceeded)
-        else:
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.ErrorMessage = "Could not switch accounts"
-        response.RequestId = msgObj.RequestId
-        self.sendPacket(response)
-    
-    def __handleBalanceRequest(self, protocol, msg):
-        # permissions: regular(b)
-        debugPrint("server __handleBalanceRequest requestID:", msg.RequestId, type(msg.RequestId))
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if not account:
-            self.__logSecure("Cannot get balance when no account selected")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Account must be selected"
-            self.sendPacket(response)
-            return None
-        if 'b' not in access:
-            self.__logSecure("Required 'b' access for account %s, but had %s" % (account, access))
-            return self.__sendPermissionDenied("No Permission to check Balances", 
-                                               msgObj.RequestId)
-        balance = self.__bank.getBalance(account) or 0
-        debugPrint("Balance for account", account, ":", balance)
-        response = self.__createResponse(msgObj, BalanceResponse)
-        response.RequestId = msgObj.RequestId
-        response.Balance = balance
-        self.__logSecure("Sending back balance")
-        self.sendPacket(response)
-        
-    def __handleAdminBalanceRequest(self, protocol, msg):
-        # permissions: Admin(B)
-        msgObj = msg
-        adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-        if adminAccess is None:
-            self.__logSecure("No admin access to get admin balances")
-            return
-        if "B" not in adminAccess:
-            self.__logSecure("Requires 'B' access for balances, but have %s" % adminAccess)
-            return self.__sendPermissionDenied("Requires 'B' access", msgObj.RequestId)
-        accountList = self.__bank.getAccounts()
-        balancesList = []
-        for account in accountList:
-            balancesList.append(self.__bank.getBalance(account))
-        response = self.__createResponse(msgObj, AdminBalanceResponse)
-        response.RequestId = msgObj.RequestId
-        response.Accounts = list(accountList)
-        response.Balances = balancesList
-        self.__logSecure("Sending back %d balances" % len(balancesList))
-        self.sendPacket(response)
-        
-    def __handleTransferRequest(self, protocol, msg):
-        # permissions: regular(t)
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if not account:
-            self.__logSecure("Cannot get transfer when no account selected")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Account must be selected"
-            self.sendPacket(response)
-        if not 't' in access:
-            self.__logSecure("Requires 't' access to transfer from %s, but have %s" % (account, access))
-            return self.__sendPermissionDenied("Requires 't' access", msgObj.RequestId)
-        dstAccount = msgObj.DstAccount
-        if not dstAccount in self.__bank.getAccounts():
-            return self.__error("Invalid destination account %s" % dstAccount, msgObj.RequestId,
-                                fatal=False)
-        amount = msgObj.Amount
-        if amount < 0: 
-            return self.__error("Invalid (negative) amount %d" % amount, msgObj.RequestId,
-                                fatal=False)
-        if amount > self.__bank.getBalance(account):
-            return self.__error("Insufficient Funds to pay %d" % amount, msgObj.RequestId,
-                                fatal=False)
-        result = self.__bank.transfer(account,dstAccount, amount, msgObj.Memo)
-        if not result.succeeded():
-            return self.__error("Bank transfer failed: " + result.msg(), msgObj.RequestId,
-                                fatal=True)
-        # Assume single threaded. The last transaction will still be the one we care about
-        result = self.__bank.generateReceipt(dstAccount)
-        if not result.succeeded():
-            return self.__error("Bank transfer failed: " + result.msg(), msgObj.RequestId,
-                                fatal=True)
-        receipt, signature = result.value()
-        response = self.__createResponse(msgObj, Receipt)
-        response.RequestId = msgObj.RequestId
-        response.Receipt = receipt
-        response.ReceiptSignature = signature
-        self.__logSecure("Transfer succeeded, sending receipt")
-        self.sendPacket(response)
-        
-    def __handleDeposit(self, protocol, msg):
-        # requires: regular(d)
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if not account:
-            self.__logSecure("Cannot get deposit when no account selected")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Account must be selected"
-            self.sendPacket(response)
-        if 'd' not in access:
-            self.__logSecure("Requires 'd' access to deposit in %s, but have %s" % (account, access))
-            return self.__sendPermissionDenied("Requires 'd' access", msgObj.RequestId)
-        bps = []
-        bpData = eval(msgObj.bpData)
-        # debugPrint(bpData[:15], "...", bpData[-15:], len(bpData), type(bpData))
-        while bpData:
-            newBitPoint, offset = BitPoint.deserialize(bpData)
-            bpData = bpData[offset:]
-            bps.append(newBitPoint)
-        result = self.__bank.depositCash(account,bps)
-        if not result.succeeded():
-            self.__logSecure("Deposit failed, %s" % result.msg())
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = result.msg()
-        else:
-            result = self.__bank.generateReceipt(account)
-            if not result.succeeded():
-                self.__logSecure("Could not generate receipt? %s" % result.msg())
-                response = self.__createResponse(msgObj, RequestFailure)
-                response.RequestId = msgObj.RequestId
-                response.ErrorMessage = result.msg()
-            else:
-                self.__logSecure("Deposit complete. Sending Signed Receipt")
-                receipt, signature = result.value()
-                response = self.__createResponse(msgObj, Receipt)
-                response.RequestId = msgObj.RequestId
-                response.Receipt = receipt
-                response.ReceiptSignature = signature
-        self.sendPacket(response)
-        
-    def __handleWithdrawal(self, protocol, msg):
-        # requires: regular(d)
-        msgObj = msg
-        account, access = self.__getSessionAccount(msgObj)
-        if not account:
-            self.__logSecure("Cannot withdraw when no account selected")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Account must be selected"
-            self.sendPacket(response)
-        if 'd' not in access:
-            self.__logSecure("Requires 'd' access to withdraw from %s but have %s" % (account, access))
-            return self.__sendPermissionDenied("Requires 'd' access", msgObj.RequestId)
-        if self.__withdrawlTracking.get(account,0)+msgObj.Amount > self.WITHDRAWAL_LIMIT:
-            self.__logSecure("Attempt to withdraw over the limit. Current: %d, requested: %d, limit: %d" % 
-                             (self.__withdrawlTracking.get(account, 0), msgObj.Amount, self.WITHDRAWAL_LIMIT))
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Over Limit"
-            self.sendPacket(response)
-            return
-        result = self.__bank.withdrawCash(account,msgObj.Amount)
-        if not result.succeeded():
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = result.msg()
-        else:
-            if account not in self.__withdrawlTracking:
-                self.__withdrawlTracking[account] = 0
-                callLater(self.WITHDRAWAL_WINDOW, lambda: self.__clearWithdrawlLimit(account))
-            self.__withdrawlTracking[account] += msgObj.Amount
-            bitPoints = result.value()
-            bpData = b""
-            for bitPoint in bitPoints:
-                bpData += bitPoint.serialize()
-            response = self.__createResponse(msgObj, WithdrawalResponse)
-            response.RequestId = msgObj.RequestId
-            response.bpData = bpData
-        self.sendPacket(response)
-        
-    def __isValidUsername(self, name):
-        for letter in name:
-            if not letter.isalnum() and not letter == "_":
-                return False
-        return True
-        
-    def __handleSetUserPassword(self, protocol, msg):
-        # requires that the user is changing his own password, or Admin('A') access
-        msgObj = msg
-        userName = msgObj.loginName
-        newUser = msgObj.NewUser
-        self.__logSecure("Received change password request. Current user %s, user to change [%s]" % 
-                    (self.__connData["LoginName"], userName))
-        errorResponse = self.__createResponse(msgObj, RequestFailure)
-        errorResponse.RequestId = msgObj.RequestId
-        okResponse = self.__createResponse(msgObj, RequestSucceeded)
-        okResponse.RequestId = msgObj.RequestId
-        if not userName:
-            userName = self.__connData["LoginName"]
-        
-        if (newUser or userName != self.__connData["LoginName"]):
-            # if this is a new user, must be admin because couldn't login
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess is None:
-                self.__logSecure("Failed. Admin access required to create user, or change other user")
-                return
-            if "A" not in adminAccess:
-                self.__logSecure("Failed. Requires 'A' access, but only have %s" % adminAccess)
-                return self.__sendPermissionDenied("Requires 'A' access", msgObj.RequestId)
-            
-            if newUser and self.__pwDb.hasUser(userName):
-                self.__logSecure("Tried to create user %s that already exists" % userName)
-                errorResponse.ErrorMessage = "User %s already exists" % userName
-                self.sendPacket(errorResponse)
-                return
-            elif newUser and not self.__isValidUsername(userName):
-                self.__logSecure("Attempt to create user with invalid name [%s]" % userName)
-                errorResponse.ErrorMessage = "Username invalid. Only letters, numbers, and underscores."
-                self.sendPacket(errorResponse)
-                return
-            elif not newUser and not self.__pwDb.hasUser(userName):
-                self.__logSecure("Attempt to change password for non-existent user [%s]" % userName)
-                errorResponse.ErrorMessage = "User %s does not exist" % userName
-                self.sendPacket(errorResponse)
-                return
-        elif msgObj.oldPwHash == '':
-            # Cannot allow this.
-            self.__logSecure("Attempt to change username %s without previous hash" % userName)
-            errorResponse.ErrorMessage = "No password hash specified"
-            self.sendPacket(errorResponse)
-            return
-        elif self.__pwDb.currentUserPassword(userName) != eval(msgObj.oldPwHash):
-                self.__logSecure("Incorrect previous password for %s password change" % userName)
-                errorResponse.ErrorMessage = "Invalid Password"
-                self.sendPacket(errorResponse)
-                return
-            
-        pwHash = eval(msgObj.newPwHash)
-        self.__pwDb.createUser(userName, pwHash, modify=True)
-        self.__pwDb.sync()
-        self.__logSecure("Password changed")
-        self.sendPacket(okResponse)
-        
-    def __handleCreateAccount(self, protocol, msg):
-        # requires Admin(A)
-        msgObj = msg
-        adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-        if adminAccess is None:
-            self.__logSecure("Creating an account requires administrator access")
-            return
-        if "A" not in adminAccess:
-            self.__logSecure("Creating an account requires 'A' access. Only have %s" % adminAccess)
-            return self.__sendPermissionDenied("Requires 'A' access", msgObj.RequestId)
-        
-        response = self.__createResponse(msgObj, RequestSucceeded)
-        newAccountName = msgObj.AccountName
-        if self.__pwDb.hasAccount(newAccountName):
-            self.__logSecure("Attempt to create account that already exists")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.ErrorMessage = "That account already exists"
-        result = self.__bank.createAccount(newAccountName)
-        if result.succeeded():
-            self.__logSecure("New account %s created" % newAccountName)
-            if not self.__pwDb.hasUser(newAccountName):
-            # should only happen if we manually added a user to pwDB
-                self.__pwDb.createAccount(newAccountName)
-            self.__pwDb.sync()
-        else:
-            self.__logSecure("Internal Failure in creating account %s" % newAccountName)
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.ErrorMessage = "Could not create account. Internal error"
-        response.RequestId = msgObj.RequestId
-        self.sendPacket(response)
-        
-    def __handleCurAccess(self, protocol, msg):
-        msgObj = msg
-        userName = self.__connData["LoginName"]
-        if msgObj.UserName != FIELD_NOT_SET:
-            checkUserName = msgObj.UserName
-        else:
-            checkUserName = userName
-        if msgObj.AccountName != FIELD_NOT_SET:
-            accountName = msgObj.AccountName
-        else: accountName = None
-        self.__logSecure("Attempt to check access of %s on account %s" % (checkUserName, accountName))
-        
-        if userName != checkUserName and not accountName:
-            # requires admin access to get general permissions for other user
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess is None:
-                self.__logSecure("Checking this access requires administrative access")
-                return
-            if 'A' not in adminAccess:
-                self.__logSecure("Checking this access requires 'A' access, but have %s" % adminAccess)
-                return self.__sendPermissionDenied("Requires admin access 'A'", 
-                                                   msgObj.RequestId)
-        elif userName != checkUserName:
-            # requires 'a' to check other user's permissions on an account
-            access = self.__pwDb.currentAccess(userName, accountName) 
-            if 'a' not in access:
-                self.__logSecure("Checking this access requires 'a' access but have %s" % access)
-                return self.__sendPermissionDenied("Requires access 'a'", 
-                                                   msgObj.RequestId)
-        
-        accounts = []
-        accountsAccess = []
-        if accountName:
-            accounts.append(accountName)
-            accountsAccess.append(self.__pwDb.currentAccess(checkUserName, accountName))
-        else:
-            accessMulti = self.__pwDb.currentAccess(checkUserName)
-            for accountName, accountAccessString in accessMulti.items():
-                accounts.append(accountName)
-                accountsAccess.append(accountAccessString)
-        response = self.__createResponse(msgObj, CurAccessResponse)
-        response.RequestId = msgObj.RequestId
-        response.Accounts = accounts
-        response.Access = accountsAccess
-        self.__logSecure("Sending back access information for %s on %d accounts" % (checkUserName, len(accountsAccess)))
-        self.sendPacket(response)
-        
-    def __handleChangeAccess(self, protocol, msg):
-        # if no account is specified, it must be for the current account with 'a' access
-        # if an account is specified, it must belong to the current user with 'a' access
-        # if an account is specified that doesn't belong to the current user, Admin('A')
-        msgObj = msg
-        userName = self.__connData["LoginName"]
-        changeUserName = msgObj.UserName
-        account, access = self.__getSessionAccount(msgObj)
-        if account is None:
-            self.__logSecure("Cannot change access. There was an error in state")
-            return None # this was an actual error
-        if not account and msgObj.Account == FIELD_NOT_SET:
-            self.__logSecure("Cannot change access, no account specified, and no current account selected")
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Account must be selected or specified"
-            self.sendPacket(response)
-            return
-        if msgObj.Account != FIELD_NOT_SET:
-            account = msgObj.Account
-            self.__logSecure("Trying to change access for %s in account %s" % (userName, account))
-            access = self.__pwDb.currentAccess(userName, account)
-        if not access:
-            # doesn't own the account. Check admin 
-            # 
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess is None:
-                self.__logSecure("Access change request requires an administrator")
-                return
-            if 'A' not in adminAccess:
-                self.__logSecure("Access change request requires 'A' access, but have %s" % adminAccess)
-                return self.__sendPermissionDenied("Requires admin access or regular 'a'", 
-                                                   msgObj.RequestId)
-        elif 'a' not in access:
-            # do a non-fatal admin access check
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId, fatal=False)
-            if not adminAccess or 'A' not in adminAccess:
-                self.__logSecure("Access change request requires 'a' or 'A' but got %s and %s" % (access, adminAccess))
-                return self.__sendPermissionDenied("Requires 'a' access or admin", msgObj.RequestId)
-        
-        if not self.__pwDb.isValidAccessSpec(msgObj.AccessString, account):
-            response = self.__createResponse(msgObj, RequestFailure)
-            response.RequestId = msgObj.RequestId
-            response.ErrorMessage = "Invalid access string %s" % msgObj.AccessString
-            self.__logSecure("Tried to change access to invalid %s" % msgObj.AccessString)
-            self.sendPacket(response)
-            return
-        self.__pwDb.configureAccess(changeUserName, account, msgObj.AccessString)
-        self.__pwDb.sync()
-        response = self.__createResponse(msgObj, RequestSucceeded)
-        response.RequestId = msgObj.RequestId
-        self.__logSecure("User %s access to %s changed to %s" % (changeUserName, account, msgObj.AccessString))
-        self.sendPacket(response)
-
-    def __handleLedgerRequest(self, protocol, msg):
-        msgObj = msg
-        #account, access = self.__getSessionAccount(msgObj)
-        userName = self.__connData["LoginName"]
-        accountToGet = msgObj.Account != FIELD_NOT_SET and msgObj.Account or None
-        self.__logSecure("Request ledger for user %s and account %s" % (userName, accountToGet))
-        if not accountToGet:
-            # No account specified. Get the entire bank ledger.
-            # this is administrative access only.
-            adminAccess = self.__getAdminPermissions(msgObj.RequestId)
-            if adminAccess is None:
-                self.__logSecure("Requesting an all-accounts ledger requires admin access")
-                return
-            if 'A' not in adminAccess:
-                self.__logSecure("Requesting an all-accounts ledger requires 'A' access, but have %s" % adminAccess)
-                return self.__sendPermissionDenied("Requires admin access", 
-                                                   msgObj.RequestId)
-            # return all lines
-            lFilter = lambda lline: True
-        else:
-            accountToGetAccess = self.__pwDb.currentAccess(userName, accountToGet) 
-            if 'a' not in accountToGetAccess:
-                # don't kill the connection if we don't have admin. Just tell them.
-                adminAccess = self.__getAdminPermissions(msgObj.RequestId, fatal=False)
-                if adminAccess is None or 'A' not in adminAccess:
-                    self.__logSecure("User %s attempting to get ledger for %s requires 'a' or 'A', but have %s and %s" %
-                                     (userName, accountToGet, accountToGetAccess, adminAccess))
-                    return self.__sendPermissionDenied("Requires admin access or regular 'a'", 
-                                                       msgObj.RequestId)
-            lFilter = lambda lline: lline.partOfTransaction(accountToGet)
-        lineNums = self.__bank.searchLedger(lFilter)
-        lines = []
-        for lineNum in lineNums:
-            line = self.__bank.getLedgerLine(lineNum)
-            lines.append(line.toHumanReadableString(accountToGet))
-        response = self.__createResponse(msgObj, LedgerResponse)
-        response.RequestId = msgObj.RequestId
-        response.Lines = lines
-        self.__logSecure("User %s getting ledger for %s (%d lines" % (userName, accountToGet, len(lines)))
-        self.sendPacket(response)
-            
-    def __handleClose(self, protocol, msg):
-        debugPrint("server __handleClose", msg.DEFINITION_IDENTIFIER)
-        msgObj = msg
-        self.__logSecure("Close Connection")
-        if self.__state != self.STATE_OPEN:
-            return # silently ignore close messages on unopen connections
-        if self.__connData["ClientNonce"] != msgObj.ClientNonce:
-            return # silently ignore close messages on wrong client nonce
-        if self.__connData["ServerNonce"] != msgObj.ServerNonce:
-            return # silently ignore close messages on wrong server nonce
-        self.__state = self.STATE_UNINIT
-        if self.transport: self.transport.close()
         
         
 class BankClientProtocol(SimplePacketHandler, StackingProtocol):
@@ -1228,12 +494,13 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
     NON_ADMIN_PROMPT = "Bank Client> "
     ADMIN_PROMPT = "Bank Client [Admin]> "
 
-    def __init__(self, clientBase, bankClientFactory, bankAddr):
+    def __init__(self, clientBase, bankClientFactory, bankAddr, bankPort):
         CLIShell.CLIShell.__init__(self, prompt=self.NON_ADMIN_PROMPT)
         self.__d = None
         self.__backlog = []
         self.__bankClient = None
         self.__bankAddr = bankAddr
+        self.__bankPort = bankPort
         self.__bankClientFactory = bankClientFactory
         # self.__clientBase = clientBase
         self.__connected = False
@@ -1407,12 +674,13 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__d = None
 
     def connection_made(self, transport):
+        print("connection_made")
         try:
             CLIShell.CLIShell.connection_made(self, transport)
 
             loop = self.__asyncLoop
             debugPrint("CLI Making a client connection...")
-            coro = playground.getConnector(self.__bankClientFactory.stack).create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, BANK_FIXED_PLAYGROUND_PORT)
+            coro = playground.getConnector(self.__bankClientFactory.stack).create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, self.__bankPort)
             debugPrint("CLI Running client protocol coroutine...")
             fut = asyncio.run_coroutine_threadsafe(coro, self.__asyncLoop)
             fut.add_done_callback(self.__handleClientConnection)
@@ -1818,92 +1086,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.registerCommand(accountHandler)
         self.registerCommand(userHandler)
         self.registerCommand(exportCommandHandler)
-            
-class PlaygroundNodeControl(object):
-    Name = "OnlineBank"
-    def __init__(self):
-        self.__mode = None
-        self.__stdioUI = None
-    
-    def processServer(self, serverArgs):
-        self.__mode = "server"
-        if len(serverArgs) not in [4,5]:
-            return (False, "Bank server requires " +
-                            "passwordFile, bankPath, certPath, (optional: mintCert)")
-
-        stack, passwordFile, bankPath, certPath = serverArgs[0:4]
-
-        if not os.path.exists(passwordFile):
-            return (False, "Could not locate passwordFile " + passwordFile)
-        if not os.path.exists(certPath):
-            return (False, "Could not locate cert file " + certPath)
-        cert = loadCertFromFile(certPath)
-        ledgerPassword = getpass.getpass("Enter bank password:")
-        enableSecurityLogging(bankPath)
-        logSecure("Security Logging Enabled, creating bank server from path %s" % bankPath)
-        bank = Ledger(bankPath, cert, ledgerPassword)
-        self.bankServer = PlaygroundOnlineBank(passwordFile, bank)
-        if len(serverArgs) == 4:
-            mintCertFile = serverArgs[3]
-            result = bank.registerMintCert(mintCertFile)
-            if not result.succeeded():
-                print("Could not load certificate", result.msg())
-
-        loop = asyncio.get_event_loop()
-        loop.set_debug(enabled=True)
-        coro = playground.getConnector(stack).create_playground_server(self.bankServer.buildProtocol, BANK_FIXED_PLAYGROUND_PORT)
-        server = loop.run_until_complete(coro)
-        print("Bank Server Started at {}".format(server.sockets[0].gethostname()))
-        print("To access start a bank client protocol to %s:%s" % (BANK_FIXED_PLAYGROUND_ADDR,BANK_FIXED_PLAYGROUND_PORT)) # TODO: change address to display the correct host Playground address
-        loop.run_forever()
-        loop.close()
-        return (True,"")
-    
-    def processClient(self, clientArgs):
-        self.__mode = "client"
-        if len(clientArgs) == 4:
-            stack, remoteAddress, certPath, loginName= clientArgs[0:4]
-        else:
-            return (False, "Bank client CLI requires remote, address, certPath, and user loginName")
-        if not os.path.exists(certPath):
-            return (False, "Could not locate cert file " + certPath)
-
-        # remove this to accept the provided address instead
-        # remoteAddress = BANK_FIXED_PLAYGROUND_ADDR
-
-        cert = loadCertFromFile(certPath)
-        passwd = getpass.getpass("Enter bank account password for %s: "%loginName)
-
-        clientFactory = PlaygroundOnlineBankClient(cert, loginName, passwd)
-        clientFactory.stack = stack # UGLY HACK TO FIX LATER
-
-        loop = asyncio.get_event_loop()
-
-        def initShell():
-            uiFactory = AdminBankCLIClient(None, clientFactory, remoteAddress)
-            uiFactory.registerExitListener(lambda reason: loop.call_later(2.0, loop.stop))
-            a = CLIShell.AdvancedStdio(uiFactory)
-
-        # loop.set_debug(enabled=True)
-        loop.call_soon(initShell)
-        loop.run_forever()
-        return (True, "")
-    
-    def getStdioProtocol(self):
-        return self.__stdioUI
-    
-    def start(self, args):
-        if len(args) == 0 or args[0] not in ['server', 'client']:
-            return (False, "OnlineBank requires either 'server' or 'client' not %s" % args[0])
-        if args[0] == 'server':
-            return self.processServer(args[1:])
-        if args[0] == 'client':
-            return self.processClient(args[1:])
-        return (False, "Internal inconsistency. Should not get here")
-    
-    def stop(self):
-        # not yet implemented
-        return (True,"")
+           
     
 class PasswordData(object):
     # NOTE. Uses shelve.
@@ -1923,7 +1106,7 @@ class PasswordData(object):
     def __init__(self, filename):
         self.__filename = filename
         if not os.path.exists(self.__filename):
-            print("File %s not found. Creating a new DB..." % self.__filename)
+            #print("File %s not found. Creating a new DB..." % self.__filename)
             self.__createDB(self.__filename)
         else: self.__loadDB(self.__filename)
             
@@ -1990,7 +1173,7 @@ class PasswordData(object):
         debugPrint("pwD currentAccess un:", userName,"acc:", accountName)
         access = self.__tmpUserTable.get(userName, {})
         if accountName:
-            return access.get(accountName, {})
+            return access.get(accountName, '')
         else: return access
     
     def __setUserAccess(self, userName, accountName, privilegeData):
@@ -2065,97 +1248,473 @@ def getPasswordHashRoutine(currentPw=None):
 
 def debugPrint(*s):
     if DEBUG: print("\033[93m[%s]" % round(time.time() % 1e4, 4), *s, "\033[0m")
+    
+class OnlineBankInterface:
+    def __init__(self):
+        self.init_argument_handling()
+        playgroundPath = Configure.CurrentPath()
+        self._bankconfigPath = os.path.join(playgroundPath, "bank")
+        if not os.path.exists(self._bankconfigPath):
+            os.mkdir(self._bankconfigPath)
+        
+        self._pwfile = os.path.join(self._bankconfigPath, "login_data.db")
+        self._bankPath = os.path.join(self._bankconfigPath, "bankdata")
+        self._certPath = os.path.join(self._bankconfigPath, "bank.cert")
+        self._keyPath  = os.path.join(self._bankconfigPath, "bank.key")
+        self._mintCertPath = os.path.join(self._bankconfigPath, "mint.cert")
+        self._mintKeyPath = os.path.join(self._bankconfigPath, "mint.key")
+        self._mintPath = os.path.join(self._bankconfigPath, "mint")
+        
+        self._printedBpDir = os.path.join(self._bankconfigPath, "printed_bitpoints")
+        if not os.path.exists(self._printedBpDir):
+            os.mkdir(self._printedBpDir)
+        if not os.path.exists(self._bankPath):
+            os.mkdir(self._bankPath)
+            
+        self._verbose = False
+            
+    def info(self, msg):
+        self._verbose and print(msg)
+        
+    def generate_key_and_cert(self, common_name, key_path, cert_path):
+        key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Maryland"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, "Baltimore"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "EN 601.644"),
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+        ])
+        cert = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            issuer
+        ).public_key(
+            key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.utcnow()
+        ).not_valid_after(
+            datetime.datetime.utcnow() + datetime.timedelta(days=90)
+        ).sign(key, hashes.SHA256(), default_backend())
 
-def main(args):
-    if len(args) < 2 or args[1] in ["help","--help","-h"]:
-        sys.exit(USAGE)
-    if args[1] == "pw":
-        if len(args) < 4:
-            sys.exit(USAGE)
-        pwfile, cmd = args[2:4]
-        pwDB = PasswordData(pwfile)
-        if cmd == "user":
-            if len(args) != 6:
-                sys.exit(USAGE)
-            subcmd, userName = args[4:6]
-            if subcmd == "add":
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))        
+        
+    def initialize_bank(self, args):
+        if not os.path.exists(self._bankconfigPath):
+            os.mkdir(self._bankconfigPath)
+        if args.initialize_cmd == "client":
+            shutil.copy2(args.bank_cert, self._certPath)
+        elif args.initialize_cmd == "mint":
+            self.info("== Initialize Mint ==")
+            passwd = getpass.getpass("Create mint password: ")
+            passwd2 = getpass.getpass("Re-enter mint password: ")
+            if passwd != passwd2:
+                sys.exit("Passwords do not match")
+                
+            if args.mint_key == "generate":
+                self.info("... Generating mint key and certificate.")
+                common_name = args.mint_cert
+                self.generate_key_and_cert(common_name, self._mintKeyPath, self._mintCertPath)
+            else:
+                shutil.copy2(args.mint_cert, self._mintCertPath)
+                shutil.copy2(args.mint_key, self._mintKeyPath)
+            os.chmod(self._mintKeyPath, stat.S_IREAD)
+
+            cert = loadCertFromFile(self._mintCertPath)
+            key = loadPrivateKeyFromPemFile(self._mintKeyPath)
+            
+            self.info("... Creating printing press vault.")
+            PrintingPress.CreateBankVault(self._mintPath, cert, key, passwd)
+            
+            serializer = DefaultSerializer(self._printedBpDir)
+            mint = PrintingPress(cert, passwd, self._mintPath)
+            denomination_letter = args.initial_bitpoints[-1]
+            if denomination_letter.isnumeric():
+                denominations = int(args.initial_bitpoints)
+                count = 1
+            elif denomination_letter == 'k':
+                denominations = 1000
+                count = int(args.initial_bitpoints[:-1])
+            elif denomination_letter == 'm':
+                denominations = 1000000
+                count = int(args.initial_bitpoints[:-1])
+            else:
+                raise Exception("Unknown bp identifier {}".format(denomination_letter))
+            self.info("... Printing a total of {}x{} bitpoints.".format(count, denominations))
+            for i in range(count):
+                mint.mintBitPoints(denominations, serializer)
+                self.info("\tPrinted {}x{}".format(i+1, denominations))
+            self.info("== END MINT INIT ==")
+
+        elif args.initialize_cmd == "server":
+            self.info("== Initialize Bank Server ==")
+            passwd = getpass.getpass("Create bank password: ")
+            passwd2 = getpass.getpass("Re-enter bank password: ")
+            if passwd != passwd2:
+                raise Exception("Mismatching bank passwords")
+                
+            if args.bank_key == "generate":
+                self.info("... Generating bank key and certificate.")
+                common_name = args.bank_cert
+                self.generate_key_and_cert(common_name, self._keyPath, self._certPath)
+                
+                # if we're generating a bank key and cert, also generate a mint if needed
+                if not os.path.exists(self._mintKeyPath):
+                    self.info("... Mint does not yet exist. Generate.")
+                    args.initialize_cmd = "mint"
+                    args.mint_key = "generate"
+                    args.mint_cert = common_name + " mint"
+                    args.initial_bitpoints = "100k"
+                    self.initialize_bank(args)
+            else:
+                if not os.path.exists(self._mintKeyPath):
+                    raise Exception("Cannot initialize a bank without a mint")
+                shutil.copy2(args.bank_cert, self._certPath)
+                shutil.copy2(args.bank_key, self._keyPath)
+            os.chmod(self._keyPath, stat.S_IREAD)
+                
+            cert = loadCertFromFile(self._certPath)
+            key = loadPrivateKeyFromPemFile(self._keyPath)
+            
+            self.info("... Create bank ledger")
+            Ledger.InitializeDb(self._bankPath, cert, key, passwd)
+            bank = Ledger(self._bankPath, cert, passwd)
+            
+            self.info("... register mint certificate.")
+            result = bank.registerMintCert(self._mintCertPath)
+            if not isinstance(result, LedgerOperationSuccess):
+                raise Exception("Could not load certificate: {}".format(result.msg()))
+
+            for rootdir, dirs, files in os.walk(self._printedBpDir):
+                if rootdir != self._printedBpDir: continue
+                for bp_file in files:
+                    self.info("... Uploading bit point file {} to bank.".format(bp_file))
+                    bp_file_path = os.path.join(rootdir, bp_file)
+                    with open(bp_file_path, "rb") as f: 
+                        bps = BitPoint.deserializeAll(f)
+                        result = bank.depositCash("VAULT", bps)
+                        if not isinstance(result, LedgerOperationSuccess):
+                            raise Exception("Could not load bitpoints. Bank in unknown state.")
+            
+            self.info("... Create administrator {}.".format(args.bank_administrator))
+            # create the administrator
+            admin_pw = 1
+            admin_pw2 = 2
+            while admin_pw != admin_pw2:
+                admin_pw = getpass.getpass("Create bank administrator password: ")
+                admin_pw2 = getpass.getpass("Verify bank administrator password: ")
+            
+            pwDB = PasswordData(self._pwfile)
+            pwDB.createUser(args.bank_administrator, PasswordHash(admin_pw), modify=False)
+            
+            # admin accounts are already created
+            pwDB.configureAccess(
+                args.bank_administrator, 
+                PasswordData.ADMIN_ACCOUNT, 
+                PasswordData.ADMIN_PRIVILEGES)
+                
+            pwDB.sync()
+            self.info("== END INIT BANK SERVER ==")
+        
+    def init_argument_handling(self):
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-v","--verbose",action="store_true",default=False)
+        subparsers = parser.add_subparsers(dest='cmd')
+        
+        initialize_parser = subparsers.add_parser("initialize")
+        
+        initialize_parser_parsers = initialize_parser.add_subparsers(dest='initialize_cmd')
+        init_client_parser = initialize_parser_parsers.add_parser("client")
+        init_client_parser.add_argument('bank_cert')
+        init_client_parser.add_argument("-v","--verbose",action="store_true",default=False)
+        
+        init_mint_parser = initialize_parser_parsers.add_parser('mint')
+        init_mint_parser.add_argument('mint_key')
+        init_mint_parser.add_argument('mint_cert')
+        init_mint_parser.add_argument("initial_bitpoints")
+        init_mint_parser.add_argument("-v","--verbose",action="store_true",default=False)
+        
+        init_server_parser = initialize_parser_parsers.add_parser('server')
+        init_server_parser.add_argument("bank_key")
+        init_server_parser.add_argument("bank_cert")
+        init_server_parser.add_argument('bank_administrator')
+        init_server_parser.add_argument("-v","--verbose",action="store_true",default=False)
+        
+        config_parser = subparsers.add_parser('config')
+        config_parser.add_argument('setting')
+        config_parser.add_argument('setting_args',nargs="*")
+        
+        db_parser = subparsers.add_parser('db')
+        db_subparsers = db_parser.add_subparsers(dest='db_cmd')
+        
+        user_parser = db_subparsers.add_parser("user")
+        user_subparsers = user_parser.add_subparsers(dest='user_cmd')
+        
+        adduser_parser = user_subparsers.add_parser("add")
+        adduser_parser.add_argument('user_name')
+        
+        deluser_parser = user_subparsers.add_parser('del')
+        deluser_parser.add_argument('user_name')
+        
+        pw_parser = user_subparsers.add_parser('pwd')
+        pw_parser.add_argument('user_name')
+        
+        chmoduser_parser = user_subparsers.add_parser('chmod')
+        chmoduser_parser.add_argument('user_name')
+        chmoduser_parser.add_argument('account_name',nargs="?")
+        chmoduser_parser.add_argument('privileges',nargs="?")
+        
+        account_parser = db_subparsers.add_parser('account')
+        account_parser.add_argument('account_cmd',choices=['add','del'])
+        account_parser.add_argument('account_name')
+        
+        verify_parser = subparsers.add_parser('verify')
+        verify_parser.add_argument('receipt_file')
+        verify_parser.add_argument('receipt_sig_file')
+        
+        server_parser = subparsers.add_parser('server')
+        client_parser = subparsers.add_parser('client')
+        client_parser.add_argument('--override', '-x', action='append', nargs=2)
+        
+        self._parser = parser
+        
+    def handle_db_cmd(self, args):
+        pwDB = PasswordData(self._pwfile)
+        
+        if args.db_cmd == "user":
+            userName = args.user_name
+            
+            if args.user_cmd == "add":
                 if pwDB.hasUser(userName):
                     sys.exit("User %s already exists" % userName)
                 newPw = getPasswordHashRoutine()
                 pwDB.createUser(userName, newPw, modify=False)
-            elif subcmd == "del":
+                
+            elif args.user_cmd == "del":
                 if not pwDB.hasUser(userName):
                     sys.exit("No such user login name: " + userName)
                 pwDB.removeUser(userName)
-            elif subcmd == "change":
+                
+            elif args.user_cmd == "pwd":
                 if not pwDB.hasUser(userName):
                     sys.exit("User %s does not already exist" % userName)
                 oldPwHash = pwDB.currentUserPassword(userName)
                 newPw = getPasswordHashRoutine(oldPwHash)
                 pwDB.createUser(userName, newPw, modify=True)
+                
+            elif args.user_cmd == "chmod":
+                accountName = args.account_name
+                accessString = args.privileges
+                
+                if not pwDB.hasUser(userName):
+                    sys.exit("User %s does not already exist" % userName)
+                
+                if accountName and not pwDB.hasAccount(accountName):
+                    sys.exit("Account %s does not exist" % accountName)
+                    
+                if accountName and accessString:
+                    if not pwDB.isValidAccessSpec(accessString, accountName):
+                        sys.exit("Invalid access spec")
+                    pwDB.configureAccess(userName, accountName, accessString)
+                else:
+                    print("current privileges", pwDB.currentAccess(userName, accountName))
+                
             else:
-                sys.exit(USAGE)
-        elif cmd == "account":
-            if len(args) != 6:
-                sys.exit(USAGE)
-            subcmd, accountName = args[4:6]
-            if subcmd == "add":
+                print("Unhandled command {}".format(args.user_cmd))
+                
+        elif args.db_cmd == "account":
+            # Unfortunately, the password database and the
+            # bank ledger database have to be kept in sync. 
+            # Both have to have the same set of accounts.
+            # TODO: Fix this.
+            passwd = getpass.getpass("Bank password required for changing account: ")
+            accountName = args.account_name
+            if args.account_cmd == "add":
                 if pwDB.hasAccount(accountName):
                     sys.exit("Account %s already exists" % accountName)
+                
+                bank = Ledger(self._bankPath, self._certPath, passwd)
+                bank.createAccount(accountName)
                 pwDB.createAccount(accountName)
+            elif args.account_cmd == "del":
+                sys.exit("Account del not yet implemented")
             else:
-                sys.exit(USAGE)
-        elif cmd == "chmod":
-            if len(args) == 5:
-                userName = args[4]
-                accountName, accessString = None, None
-            elif len(args) == 6:
-                userName, accountName = args[4:6]
-                accessString = None
-            elif len(args) == 7:
-                userName, accountName, accessString = args[4:7]
-            else:
-                sys.exit(USAGE)
-            if not pwDB.hasUser(userName):
-                sys.exit("User %s does not already exist" % userName)
-            if accountName and not pwDB.hasAccount(accountName):
-                sys.exit("Account %s does not exist" % accountName)
-            if accountName and accessString:
-                if not pwDB.isValidAccessSpec(accessString, accountName):
-                    sys.exit("Invalid access spec")
-                pwDB.configureAccess(userName, accountName, accessString)
-            else:
-                print("current privileges", pwDB.currentAccess(userName, accountName))
+                print ("Unhandled command {}".format(args.account_cmd))
+                
         pwDB.sync()
         sys.exit("Finished.")
+        
+    def handle_server(self):
+        if "SERVER" not in self._bankConfig:
+            raise Exception("Server has not yet been configured.")
+        required_config = "port",
+        for k in required_config:
+            if k not in self._bankConfig["SERVER"]:
+                raise Exception("Client not yet configured. Requires {}".format(k))
+                
+        enableSecurityLogging(self._bankPath)
+        logSecure("Security Logging Enabled, creating bank server from path %s" % self._bankPath)
+        
+        cert = loadCertFromFile(self._certPath)
+        ledgerPassword = getpass.getpass("Enter bank password:")
+        
+        bank = Ledger(self._bankPath, cert, ledgerPassword)
+        bankServer = PlaygroundOnlineBank(self._pwfile, bank)
+        if self._mintCertPath:
+            result = bank.registerMintCert(self._mintCertPath)
+            if not result.succeeded():
+                sys.exit("Could not load mint certificate", result.msg())
+                
+        bankPort = int(self._bankConfig["SERVER"]["port"])
+        stack = self._bankConfig["SERVER"].get("stack","default")
 
-    elif args[1] == "verify_receipt":
-        certfile, receipt, receiptSig = args[2:5]
-        cert = loadCertFromFile(certfile)
-        verifier = RSA_SIGNATURE_MAC(cert.public_key())
-        with open(receipt,"rb") as f:
-            receiptData = f.read()
-        with open(receiptSig,"rb") as f:
-            receiptSigData = f.read()
-        print("Verification result = ",
-              verifier.verify(receiptData, receiptSigData))
+        loop = asyncio.get_event_loop()
+        loop.set_debug(enabled=True)
+        coro = playground.getConnector(stack).create_playground_server(
+            bankServer.buildProtocol, 
+            bankPort)
+        server = loop.run_until_complete(coro)
+        localhost_name = server.sockets[0].gethostname()
+        print("Bank Server Started at {}".format(localhost_name))
+        print("To access start a bank client protocol to {}".format(localhost_name))
+        loop.run_forever()
+        loop.close()
+        
+    def handle_client(self):
+        if "CLIENT" not in self._bankConfig:
+            raise Exception("Client has not yet been configured.")
+        required_config = "bank_addr", "bank_port", "username"
+        for k in required_config:
+            if k not in self._bankConfig["CLIENT"]:
+                raise Exception("Client not yet configured. Requires {}".format(k))
+        
+        bank_addr =     self._bankConfig["CLIENT"]["bank_addr"]
+        bank_port = int(self._bankConfig["CLIENT"]["bank_port"])
+        stack     =     self._bankConfig["CLIENT"].get("stack","default")
+        username  =     self._bankConfig["CLIENT"]["username"]
+        
+        
+        cert = loadCertFromFile(self._certPath)
+        passwd = getpass.getpass("Enter bank account password for {}: ".format(username))
 
-    elif args[1] == "server":
-        control = PlaygroundNodeControl()
-        args = args[1:]
-        success, reason = control.start(args)
-        if not success:
-            print(reason)
+        clientFactory = PlaygroundOnlineBankClient(cert, username, passwd)
+        clientFactory.stack = self._bankConfig["SERVER"].get("stack","default") # UGLY HACK TO FIX LATER
 
-    elif args[1] == "client":
-        control = PlaygroundNodeControl()
-        args = args[1:]
-        success, reason = control.start(args)
-        if not success:
-            print(reason)
+        loop = asyncio.get_event_loop()
 
-    else:
-        sys.exit(USAGE)
+        def initShell():
+            print("start init")
+            uiFactory = AdminBankCLIClient(None, clientFactory, bank_addr, bank_port)
+            uiFactory.registerExitListener(lambda reason: loop.call_later(2.0, loop.stop))
+            a = CLIShell.AdvancedStdio(uiFactory)
+
+        # loop.set_debug(enabled=True)
+        loop.call_soon(initShell)
+        loop.run_forever()
+            
+    def reloadConfig(self):
+        
+        bankconfigFile = os.path.join(self._bankconfigPath, "config.ini")
+        self._bankConfig = configparser.ConfigParser()
+        self._bankConfig.read(bankconfigFile)
+        
+    def saveConfig(self):
+        bankconfigFile = os.path.join(self._bankconfigPath, "config.ini")
+        with open(bankconfigFile, 'w') as configfile:
+            self._bankConfig.write(configfile)
+        
+    def handle_config(self, args):
+        self.reloadConfig()
+        section,param = args.setting.split(":")
+        section = section.upper()
+        
+        if section == "SERVER":
+        
+            if section not in self._bankConfig:
+                self._bankConfig[section] = {}
+            
+            if param == "port":
+                port, = args.setting_args
+                int(port)
+                self._bankConfig[section][param] = port
+                
+            elif param == "stack":
+                self._bankConfig[section][param] = port
+                
+            else:
+                print("Unknown settiong {}".format(args.setting))
+                
+        elif section == "CLIENT":
+            if section not in self._bankConfig:
+                self._bankConfig[section] = {}
+                
+            if param in ["username", "bank_addr", "bank_stack"]:
+                value, = args.setting_args
+                self._bankConfig[section][param] = value
+            elif param == "bank_port":
+                port, = args.setting_args
+                int(port)
+                self._bankConfig[section][param] = port
+                
+            else:
+                print("Unknown settiong {}".format(args.setting))
+        self.saveConfig()
+            
+        
+    def handle(self, args):
+        
+        args = self._parser.parse_args(args)
+        self._verbose = args.verbose
+        
+        if args.cmd == "initialize":
+            self.initialize_bank(args)
+            
+        self.reloadConfig()
+    
+        if args.cmd == "config":
+            self.handle_config(args)
+            
+        if args.cmd == "db":
+            self.handle_db_cmd(args)
+
+        elif args.cmd == "verify":
+            receipt, receiptSig = args.receipt_file, args.receipt_sig_file
+            cert = loadCertFromFile(certpath)
+            verifier = RSA_SIGNATURE_MAC(cert.public_key())
+            with open(receipt,"rb") as f:
+                receiptData = f.read()
+            with open(receiptSig,"rb") as f:
+                receiptSigData = f.read()
+            print("Verification result = ",
+                  verifier.verify(receiptData, receiptSigData))
+
+        elif args.cmd == "server":
+            self.handle_server()
+
+        elif args.cmd == "client":
+            overrides = {}
+            if args.override:
+                if "CLIENT" not in self._bankConfig:
+                    self._bankConfig["CLIENT"] = {}
+                for key, value in args.override:
+                    self._bankConfig["CLIENT"][key] = value
+            self.handle_client()
 
 if __name__ == "__main__":
-    main(args=sys.argv)
+    interface = OnlineBankInterface()
+    interface.handle(sys.argv[1:])

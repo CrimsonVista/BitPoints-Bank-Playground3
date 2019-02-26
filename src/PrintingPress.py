@@ -129,6 +129,8 @@ class DefaultSerializer(object):
         filename = "%s.%d.%s" % (self.__base, len(bps), time.ctime().replace(" ","_").replace(":","_"))
         if self.__outputDir:
             filename = os.path.join(self.__outputDir, filename)
+        while os.path.exists(filename):
+            filename = filename + "_{}".format(random.randint(0,9))
         with open(filename, "wb+") as f:
             for s in bps:
                 f.write(s.serialize())
