@@ -1592,7 +1592,7 @@ class OnlineBankInterface:
             bankServer.buildProtocol, 
             bankPort)
         server = loop.run_until_complete(coro)
-        localhost_name = server.sockets[0].gethostname()
+        localhost_name = server.sockets[0].getsockname()
         print("Bank Server Started at {}".format(localhost_name))
         print("To access start a bank client protocol to {}".format(localhost_name))
         loop.run_forever()
