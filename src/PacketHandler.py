@@ -67,8 +67,9 @@ class SimplePacketHandler(PacketHandlerInterface):
     PacketHandlerInterface and suitable for most implementing classes.
     '''
 
-    def __init__(self):
+    def __init__(self, base_type=PacketType):
         self.__packetHandlers = {}
+        self.__buffer = base_type.Deserializer()
         
     def registerPacketHandler(self, packetType, handler):
         if not issubclass(packetType, PacketType):
@@ -101,9 +102,21 @@ class SimplePacketHandler(PacketHandlerInterface):
                     del self.__packetHandlers[packetType.DEFINITION_IDENTIFIER][versionMajor]
             if len(self.__packetHandlers[packetType.DEFINITION_IDENTIFIER]) == 0:
                 del self.__packetHandlers[packetType.DEFINITION_IDENTIFIER]
+                
+    def handleData(self, protocol, data):
+        # processes data into packets. 
+        # returns an integer for the number of
+        # packets processed.
+        
+        self.__buffer.update(data)
+        processed = 0
+        for packet in self.__buffer.nextPackets():
+            if self.handlePacket(protocol, packet):
+                processed += 1
+        return processed
             
     def handlePacket(self, protocol, pkt):
-        pkt = PacketType.Deserialize(pkt)
+        #pkt = PacketType.Deserialize(pkt)
         version = pkt.DEFINITION_VERSION
         versionMajorString, versionMinorString = version.split(".")
         versionMajor = int(versionMajorString)

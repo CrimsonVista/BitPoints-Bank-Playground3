@@ -19,7 +19,6 @@ from BankMessages import *
 from Exchange import BitPoint
 
 from BankCore import LedgerOperationSuccess, Ledger, LedgerLine # For unshelving
-from AsyncIODeferred import Deferred
 
 from BankServerProtocol import BankServerProtocol
 from PrintingPress import PrintingPress, DefaultSerializer
@@ -107,12 +106,16 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         debugPrint("client protocol init")
         SimplePacketHandler.__init__(self)
         StackingProtocol.__init__(self)
+        
+        self._on_connection_made = asyncio.get_event_loop().create_future()
+        self._on_packets_received= asyncio.get_event_loop().create_future()
+        self._on_connection_lost = asyncio.get_event_loop().create_future()
+        
         self.__loginName = loginName
         self.__passwordHash = PasswordHash(password)
         self.__connData = {"ClientNonce":0,
                            "ServerNonce":0}
-        self.__deferred = {"CONNECTION":Deferred(),
-                           "TERMINATION":Deferred()}
+        self.__openRequests = {}
         self.__state = self.STATE_UNINIT
         self.__account = None
         self.__verifier = RSA_SIGNATURE_MAC(cert.public_key())
@@ -132,28 +135,16 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         self.registerPacketHandler(LedgerResponse, self.__handleStdSessionResponse)
         self.registerPacketHandler(ServerError, self.__handleServerError)
         debugPrint("Client protocol built.")
-
-    def __errorCallbackWrapper(self, e, d):
-        self.__error(e)
-        d.errback(e)
         
     def __error(self, errMsg):
         if self.__state != self.STATE_ERROR:
             self.__state = self.STATE_ERROR
             #self.reportError(errMsg)
             self.transport.close()
-            
-    def __reportExceptionAsDeferred(self, e):
-        d = Deferred()
-        # we need a call later so the client code has enough time to set the errback handler
-        callLater(.1,lambda: self.__errorCallbackWrapper(e, d))
-        return d
     
     def __nextRequestData(self):
         rId = RANDOM_u64()
-        d = Deferred()
-        self.__deferred[rId] = d
-        return rId, d
+        return rId
     
     def verify(self, msg, sig):
         return self.__verifier.verify(msg, sig)
@@ -163,80 +154,62 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
     def account(self): return self.__account
     
     def connection_made(self, transport):
-        #SimplePacketHandler.connection_made(self)
         debugPrint("Client connection made with transport %s" % transport)
-        StackingProtocol.connection_made(self, transport)
         self.transport = transport
-        d = self.__deferred.get("CONNECTION", None)
-        if d:
-            del self.__deferred["CONNECTION"]
-            d.callback(True)
-        else:
-            debugPrint("CONNECTION deferred not found")
+        self._on_connection_made.set_result(True)
 
     def sendPacket(self, packet):
         self.transport.write(packet.__serialize__())
         debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
+        
+    async def sendPacketAwaitResponse(self, packet, wait_key=None):
+        if wait_key == None:
+            wait_key = packet.RequestId
+            
+        if wait_key in self.__openRequests:
+            raise Exception("Invalid state. Already awaiting {}".format(wait_key))
+        
+        self.__openRequests[wait_key] = packet
+        self.sendPacket(packet)
+        while self.__openRequests[wait_key] == packet:
+            await self._on_packets_received
+        result = self.__openRequests.pop(wait_key)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
-    def data_received(self, packet):
-        debugPrint("client proto data_received")
+    def data_received(self, data):
         try:
-            debugPrint("Received", PacketType.Deserialize(packet).DEFINITION_IDENTIFIER)
-            self.handlePacket(None, packet)
+            debugPrint("client proto data_received")
+            packets_processed = self.handleData(self, data)
         except Exception as e:
-            logger.debug(traceback.format_exc())
+            logger_debug(traceback.format_exc())
+            
+        if packets_processed:
+            self._on_packets_received.set_result(packets_processed)
+            self._on_packets_received = asyncio.get_event_loop().create_future()
 
     def connection_lost(self, reason):
-        #SimplePacketHandler.connection_lost(self, reason)
-        StackingProtocol.connection_lost(self, reason) # Needs to be an exception??
-        d = self.__deferred.get("CONNECTION", None)
-        if d:
-            del self.__deferred["CONNECTION"]
-            d.errback(Exception("Connection lost before connection made: " + str(reason)))
-        d = self.__deferred.get("TERMINATION", None)
-        if d:
-            del self.__deferred["TERMINATION"]
-            d.callback(True)
+        self.transport = None
+        self._on_connection_lost.set_result(reason)
 
-    def waitForTermination(self):
-        d = self.__deferred["TERMINATION"]
-        return d
-
-    def waitForConnection(self):
-        debugPrint("Client waitForConnection called")
-        d =  self.__deferred.get("CONNECTION",None)
-        if not d:
-            # we've already executed. For this to run nearly immediately
-            d = Deferred()
-            callLater(.1, lambda: d.callback(True))
-        return d
-
-    def loginToServer(self):
+    async def loginToServer(self):
         debugPrint("client proto loginToServer")
-        if "CONNECTION" in self.__deferred:
-            # we haven't connected yet!
-            raise Exception("Can't login. Connection not yet made.")
         if self.__state != self.STATE_UNINIT:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
+            raise Exception("Cannot login. State: %s" % self.__state)
         openMsg = OpenSession()
         self.__connData["ClientNonce"] = RANDOM_u64()
         openMsg.ClientNonce = self.__connData["ClientNonce"]
         openMsg.Login = self.__loginName
         openMsg.PasswordHash = self.__passwordHash
         self.__state = self.STATE_WAIT_FOR_LOGIN
-        d = Deferred()
-        self.__deferred["LOGIN"] = d
-        self.sendPacket(openMsg)
-        return d
+        
+        return await self.sendPacketAwaitResponse(openMsg, "LOGIN")
 
     def __handleSessionOpen(self, protocol, msg):
         debugPrint("client proto __handleSessionOpen")
-        if self.__state != self.STATE_WAIT_FOR_LOGIN:
+        if self.__state != self.STATE_WAIT_FOR_LOGIN or "LOGIN" not in self.__openRequests:
             return self.__error("Unexpected Session Open Message. State is (%s)" % self.__state)
-        d = self.__deferred.get("LOGIN", None)
-        if not d:
-            return self.__error("Invalid internal state. No LOGIN deferred")
-        del self.__deferred["LOGIN"]
 
         msgObj = msg
         if msgObj.ClientNonce != self.__connData["ClientNonce"]:
@@ -244,49 +217,40 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         self.__connData["ServerNonce"] = msgObj.ServerNonce
         self.__account = msgObj.Account
         self.__state = self.STATE_OPEN
-        d.callback(True)
+        self.__openRequests["LOGIN"] = True
 
     def __handleLoginFailure(self, protocol, msg):
         debugPrint("client __handleLoginFailure in state", self.__state)
         msgObj = msg
-        if self.__state != self.STATE_WAIT_FOR_LOGIN:
-            return self.__error("Error logging in: %s" % msgObj.ErrorMessage)
-        d = self.__deferred.get("LOGIN", None)
-        if not d:
-            return self.__error("Invalid internal state. No LOGIN deferred")
-        del self.__deferred["LOGIN"]
-
-        msgObj = msg
-        d.errback(Exception(msgObj.ErrorMessage))
+        if self.__state != self.STATE_WAIT_FOR_LOGIN or "LOGIN" not in self.__openRequests:
+            return self.__error("Unexpected Session Open Message. State is (%s)" % self.__state)
+        self.__openRequests["LOGIN"] = False
+        return self.__error("Could not log-in: {}".format(msgObj.ErrorMessage))
 
     def __createStdSessionRequest(self, requestType, noRequestId=False):
-
         msg = requestType()
         msg.ClientNonce = self.__connData["ClientNonce"]
         msg.ServerNonce = self.__connData["ServerNonce"]
         if not noRequestId:
-            requestId, d = self.__nextRequestData()
+            requestId = self.__nextRequestData()
             msg.RequestId = requestId
-        else: d = None
-        return msg, d
+        return msg
 
     def __validateStdSessionResponse(self, msgObj):
         debugPrint("client __validateStdSessionResponse", type(msgObj))
-        d = self.__deferred.get(msgObj.RequestId, None)
-        if not d:
-            debugPrint("d is None")
-            d.errback(Exception("Invalid internal state. No deferred for request %d" % msgObj.RequestId))
-            return None
+        if not msgObj.RequestId in self.__openRequests:
+            debugPrint("No matching request ID.")
+            d.errback(Exception("Invalid internal state. No open request %d" % msgObj.RequestId))
+            return False
         if msgObj.ClientNonce != self.__connData["ClientNonce"]:
             debugPrint("Got ClientNonce:", msgObj.ClientNonce, "Expected ClientNonce:", self.__connData["ClientNonce"])
             d.errback(Exception("Invalid Connection Data (ClientNonce)"))
-            return None
+            return False
         if msgObj.ServerNonce != self.__connData["ServerNonce"]:
             debugPrint("Got ServerNonce:", msgObj.ServerNonce, "Expected ServerNonce:", self.__connData["ServerNonce"])
             d.errback(Exception("Invalid Connection Data (ServerNonce"))
-            return None
-        del self.__deferred[msgObj.RequestId]
-        return d
+            return False
+        return True
 
     # list response, swith account response, balance response
     # receipt response,
@@ -296,75 +260,69 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             debugPrint("State not Open!")
             return self.__error("Unexpected Request Response")
         msgObj = msg
-        d = self.__validateStdSessionResponse(msgObj)
-        if d: d.callback(msgObj)
+        success = self.__validateStdSessionResponse(msgObj)
+        if success:
+            self.__openRequests[msgObj.RequestId] = msgObj
 
     def __handleServerError(self, protocol, msg):
         msgObj = msg
         #self.reportError("Server Error: " + msgObj.ErrorMessage + "\nWill terminate")
         callLater(1,self.transport.close)
 
-    def listAccounts(self, userName=None):
+    async def listAccounts(self, userName=None):
         debugPrint("client listAccounts username:", userName)
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        listMsg, d = self.__createStdSessionRequest(ListAccounts)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        listMsg = self.__createStdSessionRequest(ListAccounts)
         if userName:
             listMsg.User = userName
-        self.sendPacket(listMsg)
-        return d
+        return await self.sendPacketAwaitResponse(listMsg)
 
-    def listUsers(self, account=None):
+    async def listUsers(self, account=None):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        listMsg, d = self.__createStdSessionRequest(ListUsers)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        listMsg = self.__createStdSessionRequest(ListUsers)
         if account:
             listMsg.Account = account
-        self.sendPacket(listMsg)
-        return d
+        return await self.sendPacketAwaitResponse(listMsg)
 
-    def switchAccount(self, accountName):
+    async def switchAccount(self, accountName):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        switchMsg, d = self.__createStdSessionRequest(SwitchAccount)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        switchMsg = self.__createStdSessionRequest(SwitchAccount)
         switchMsg.Account = accountName
-        self.sendPacket(switchMsg)
-        return d
+        return await self.sendPacketAwaitResponse(switchMsg)
 
-    def currentAccount(self):
+    async def currentAccount(self):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        currentMsg, d = self.__createStdSessionRequest(CurrentAccount)
-        self.sendPacket(currentMsg)
-        return d
+            raise Exception("Cannot login. State: %s" % self.__state)
+        currentMsg = self.__createStdSessionRequest(CurrentAccount)
+        return await self.sendPacketAwaitResponse(currentMsg)
 
-    def currentAccess(self, userName=None, accountName=None):
+    async def currentAccess(self, userName=None, accountName=None):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        curAccessMsg, d = self.__createStdSessionRequest(CurAccessRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        curAccessMsg = self.__createStdSessionRequest(CurAccessRequest)
         if userName:
             curAccessMsg.UserName = userName
         if accountName:
             curAccessMsg.AccountName = accountName
-        self.sendPacket(curAccessMsg)
-        return d
+        return await self.sendPacketAwaitResponse(curAccessMsg)
 
-    def getBalance(self):
+    async def getBalance(self):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        balanceMsg, d = self.__createStdSessionRequest(BalanceRequest)
-        self.sendPacket(balanceMsg)
-        return d
+            raise Exception("Cannot login. State: %s" % self.__state)
+        balanceMsg = self.__createStdSessionRequest(BalanceRequest)
+        return await self.sendPacketAwaitResponse(balanceMsg)
 
-    def transfer(self, dstAccount, amount, memo):
+    async def transfer(self, dstAccount, amount, memo):
         if self.__state != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        transferMsg, d = self.__createStdSessionRequest(TransferRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        transferMsg = self.__createStdSessionRequest(TransferRequest)
         transferMsg.DstAccount = dstAccount
         transferMsg.Amount = amount
         transferMsg.Memo = memo
-        self.sendPacket(transferMsg)
-        return d
+        return await self.sendPacketAwaitResponse(transferMsg)
 
     def close(self):
         debugPrint("client close (current state: %s)" % self.__state)
@@ -372,7 +330,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             return # silently ignore closing a non-open connection
         self.__state = self.STATE_UNINIT
         if self.transport:
-            closeMsg, d = self.__createStdSessionRequest(Close, noRequestId=True)
+            closeMsg = self.__createStdSessionRequest(Close, noRequestId=True)
             self.sendPacket(closeMsg)
             callLater(.1, self.transport.close)
 
@@ -380,60 +338,52 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         msgObj = msg
         if self.__state != self.STATE_OPEN:
             return self.__error("Unexpected Request Failure. Should be state %s but state %s. Failure Message: %s" % (self.STATE_OPEN, self.__state, msgObj.ErrorMessage))
-        d = self.__deferred.get(msgObj.RequestId, None)
-        if not d:
-            return self.__error("Invalid internal state. No deferred for request %d. Error msg: %s" % (msgObj.RequestId, msgObj.ErrorMessage))
-        del self.__deferred[msgObj.RequestId]
+        if msgObj.RequestId not in self.__openRequests:
+            return self.__error("Invalid internal state. No open request %d. Error msg: %s" % (msgObj.RequestId, msgObj.ErrorMessage))
+        self.__openRequests[msgObj.RequestId] = Exception(msgObj.ErrorMessage)
 
-        d.errback(Exception(msgObj.ErrorMessage))
-
-    def adminGetBalances(self):
+    async def adminGetBalances(self):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        balanceMsg, d = self.__createStdSessionRequest(AdminBalanceRequest)
-        self.sendPacket(balanceMsg)
-        return d
+            raise Exception("Cannot login. State: %s" % self.__state)
+        balanceMsg = self.__createStdSessionRequest(AdminBalanceRequest)
+        return await self.sendPacketAwaitResponse(balanceMsg)
 
-    def deposit(self, serializedBp):
+    async def deposit(self, serializedBp):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        depositMsg, d = self.__createStdSessionRequest(DepositRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        depositMsg = self.__createStdSessionRequest(DepositRequest)
         depositMsg.bpData = serializedBp
         # debugPrint(depositMsg.bpData[:15], "...", depositMsg.bpData[-15:], len(depositMsg.bpData), type(depositMsg.bpData))
-        self.sendPacket(depositMsg)
-        return d
+        return await self.sendPacketAwaitResponse(depositMsg)
 
-    def withdraw(self, amount):
+    async def withdraw(self, amount):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        withdrawalMsg, d = self.__createStdSessionRequest(WithdrawalRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        withdrawalMsg = self.__createStdSessionRequest(WithdrawalRequest)
         withdrawalMsg.Amount = amount
-        self.sendPacket(withdrawalMsg)
-        return d
+        return await self.sendPacketAwaitResponse(withdrawalMsg)
 
-    def adminCreateUser(self, loginName, password):
+    async def adminCreateUser(self, loginName, password):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        createMsg, d = self.__createStdSessionRequest(SetUserPasswordRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        createMsg = self.__createStdSessionRequest(SetUserPasswordRequest)
         createMsg.loginName = loginName
         createMsg.oldPwHash = ''
         createMsg.newPwHash = PasswordHash(password)
         createMsg.NewUser = True
-        self.sendPacket(createMsg)
-        return d
+        return await self.sendPacketAwaitResponse(createMsg)
 
-    def adminCreateAccount(self, accountName):
+    async def adminCreateAccount(self, accountName):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        createMsg, d = self.__createStdSessionRequest(CreateAccountRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        createMsg = self.__createStdSessionRequest(CreateAccountRequest)
         createMsg.AccountName = accountName
-        self.sendPacket(createMsg)
-        return d
+        return await self.sendPacketAwaitResponse(createMsg)
 
-    def changePassword(self, newPassword, oldPassword=None, loginName=None):
+    async def changePassword(self, newPassword, oldPassword=None, loginName=None):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        changeMsg, d = self.__createStdSessionRequest(SetUserPasswordRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        changeMsg = self.__createStdSessionRequest(SetUserPasswordRequest)
         if loginName:
             changeMsg.loginName = loginName
         else: changeMsg.loginName = ""
@@ -442,28 +392,25 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         else: changeMsg.oldPwHash = ""
         changeMsg.newPwHash = PasswordHash(newPassword)
         changeMsg.NewUser = False
-        self.sendPacket(changeMsg)
-        return d
+        return await self.sendPacket(changeMsg)
 
-    def changeAccess(self, username, access, account=None):
+    async def changeAccess(self, username, access, account=None):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        changeMsg, d = self.__createStdSessionRequest(ChangeAccessRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        changeMsg = self.__createStdSessionRequest(ChangeAccessRequest)
         changeMsg.UserName = username
         changeMsg.AccessString = access
         if account:
             changeMsg.Account = account
-        self.sendPacket(changeMsg)
-        return d
+        return await self.sendPacket(changeMsg)
 
-    def exportLedger(self, account):
+    async def exportLedger(self, account):
         if self.state() != self.STATE_OPEN:
-            return self.__reportExceptionAsDeferred(Exception("Cannot login. State: %s" % self.__state))
-        ledgerMsg, d = self.__createStdSessionRequest(LedgerRequest)
+            raise Exception("Cannot login. State: %s" % self.__state)
+        ledgerMsg = self.__createStdSessionRequest(LedgerRequest)
         if account:
             ledgerMsg.Account = account
-        self.sendPacket(ledgerMsg)
-        return d
+        return await self.sendPacketAwaitResponse(ledgerMsg)
 
 
 class PlaygroundOnlineBank:
@@ -496,7 +443,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
 
     def __init__(self, clientBase, bankClientFactory, bankAddr, bankPort):
         CLIShell.CLIShell.__init__(self, prompt=self.NON_ADMIN_PROMPT)
-        self.__d = None
+        self.__cur_task = None
         self.__backlog = []
         self.__bankClient = None
         self.__bankAddr = bankAddr
@@ -508,146 +455,184 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         self.__quitCalled = False
         self.__asyncLoop = asyncio.get_event_loop()
 
-    def __loginToServer(self, success):
-        if not success:
-            return self.__noLogin(Exception("Failed to login"))
-        self.__d = self.__bankClient.loginToServer()
-        self.__d.addCallback(self.__login)
-        self.__d.addErrback(self.__noLogin)
-        return self.__d
-
-    def __login(self, success):
-        self.__connected = True
-        self.reset()
-        self.__loadCommands()
-        self.transport.write("Logged in to bank\n")
-
-    def __noLogin(self, e):
-        self.transport.write("Failed to login to bank: %s\n" % str(e))
-        self.transport.write("Quiting")
-        callLater(.1, self.quit)
-
-    def __listAccountsResponse(self, msgObj):
-        responseTxt = "  CurrentAccounts\n"
-        for account in msgObj.Accounts:
-            responseTxt += "    "+account+"\n"
-        self.transport.write(responseTxt+"\n")
-        self.reset()
-
-    def __listUsersResponse(self, msgObj):
-        responseTxt = "  CurrentUsers\n"
-        for user in msgObj.Users:
-            responseTxt += "    "+user+"\n"
-        self.transport.write(responseTxt+"\n")
-        self.reset()
-
-    def __currentAccount(self, msgObj):
-        if msgObj.Account:
-            self.transport.write("  You are currently logged into account " + msgObj.Account)
-        else:
-            self.transport.write("  You are not logged into an account. Use 'account switch [accountName]'")
-        self.transport.write("\n")
-        self.reset()
-
-    def __switchAccount(self, msgObj):
-        self.transport.write("  Successfully logged into account.")
-        self.transport.write("\n")
-        self.reset()
-
-    def __balances(self, msgObj):
-        accounts, balances = msgObj.Accounts, msgObj.Balances
-        if len(accounts) != len(balances):
-            self.transport.write("Inernal Error. Got %d accounts but %d balances\n" % (len(accounts), len(balances)))
-            return
-        responseTxt = ""
-        responseTxt += "  Current Balances:\n"
-        for i in range(len(accounts)):
-            responseTxt += "    %s: %d\n" % (accounts[i],balances[i])
-        self.transport.write(responseTxt + "\n")
-        self.reset()
-
-    def __curAccess(self, msgObj):
-        accounts, access = msgObj.Accounts, msgObj.Access
-        if len(accounts) != len(access):
-            self.transport.write("  Inernal Error. Got %d accounts but %d access\n" % (len(accounts), len(access)))
-            return
-        responseTxt = "  Current Access:\n"
-        for i in range(len(accounts)):
-            responseTxt += "    %s: %s\n" % (accounts[i], access[i])
-        self.transport.write(responseTxt + "\n")
-        self.reset()
-
-    def __accountBalanceResponse(self, msgObj):
-        result = msgObj.Balance
-        self.transport.write("Current account balance: %d\n" % result)
-        self.reset()
-
-    def __withdrawl(self, msgObj):
-        debugPrint("client __withdrawl")
-        result = eval(msgObj.bpData)
-        filename = "bp"+str(time.time())
-        open(filename,"wb").write(result)
-        self.transport.write("  Withdrew bitpoints into file %s" % filename)
-        self.transport.write("\n")
-        self.reset()
-
-    def __receipt(self, msgObj):
+    async def __doListAccounts(self, user):
         try:
-            receiptFile = "bank_receipt."+str(time.time())
-            sigFile = receiptFile + ".signature"
-            self.transport.write("Receipt and signature received. Saving as %s and %s\n" % (receiptFile, sigFile))
-            receiptBytes = eval(msgObj.Receipt)
-            sigBytes = eval(msgObj.ReceiptSignature)
-            with open(receiptFile, "wb") as f:
-                f.write(receiptBytes)
-            with open(sigFile, "wb") as f:
-                f.write(sigBytes)
-            if not self.__bankClient.verify(receiptBytes, sigBytes):
-                responseTxt = "Received a receipt with mismatching signature\n"
-                responseTxt += "Please report this to the bank administrator\n"
-                responseTxt += "Quitting\n"
-                self.transport.write(responseTxt)
-                self.quit()
+            msgObj = await self.__bankClient.listAccounts(user)
+            responseTxt = "  CurrentAccounts\n"
+            for account in msgObj.Accounts:
+                responseTxt += "    "+account+"\n"
+            self.transport.write(responseTxt+"\n")
+
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doListUsers(self, account):
+        try:
+            msgObj = await self.__bankClient.listUsers(account)
+            responseTxt = "  CurrentUsers\n"
+            for user in msgObj.Users:
+                responseTxt += "    "+user+"\n"
+            self.transport.write(responseTxt+"\n")
+
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doCurrentAccount(self):
+        try:
+            msgObj = await self.__bankClient.currentAccount()
+            if msgObj.Account:
+                self.transport.write("  You are currently logged into account " + msgObj.Account)
             else:
-                self.transport.write("Valid receipt received. Transaction complete.")
-                self.transport.write("\n")
-                self.reset()
+                self.transport.write("  You are not logged into an account. Use 'account switch [accountName]'")
+            self.transport.write("\n")
+            
+        except Exception as e:
+            self.__failed(e)
+            
+    async def __doSwitchAccount(self, switchToAccount):
+        try:
+            msgObj = await self.__bankClient.switchAccount(switchToAccount)
+            self.transport.write("  Successfully logged into account.")
+            self.transport.write("\n")
+            
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doAllBalances(self):
+        try:
+            msgObj = await self.__bankClient.adminGetBalances()
+            accounts, balances = msgObj.Accounts, msgObj.Balances
+            if len(accounts) != len(balances):
+                self.transport.write("Inernal Error. Got %d accounts but %d balances\n" % (len(accounts), len(balances)))
+                return
+            responseTxt = ""
+            responseTxt += "  Current Balances:\n"
+            for i in range(len(accounts)):
+                responseTxt += "    %s: %d\n" % (accounts[i],balances[i])
+            self.transport.write(responseTxt + "\n")
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doCurrentAccess(self, user, account):
+        try:
+            msgObj = await self.__bankClient.currentAccess(user, account)
+            accounts, access = msgObj.Accounts, msgObj.Access
+            if len(accounts) != len(access):
+                self.transport.write("  Inernal Error. Got %d accounts but %d access\n" % (len(accounts), len(access)))
+                return
+            responseTxt = "  Current Access:\n"
+            for i in range(len(accounts)):
+                responseTxt += "    %s: %s\n" % (accounts[i], access[i])
+            self.transport.write(responseTxt + "\n")
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doAccountBalance(self):
+        try:
+            msgObj = await self.__bankClient.getBalance()
+            result = msgObj.Balance
+            self.transport.write("Current account balance: %d\n" % result)
+        except Exception as e:
+            self.__failed(e)
+
+    async def __doWithdrawl(self, amount):
+        try:
+            msgObj = await self.__bankClient.withdraw(amount)
+            debugPrint("client __withdrawl")
+            result = eval(msgObj.bpData)
+            filename = "bp"+str(time.time())
+            open(filename,"wb").write(result)
+            self.transport.write("  Withdrew bitpoints into file %s" % filename)
+            self.transport.write("\n")
+        except Exception as e:
+            self.__failed(e)
+            
+    def __handleReceipt(self, msgObj):
+        receiptFile = "bank_receipt."+str(time.time())
+        sigFile = receiptFile + ".signature"
+        self.transport.write("Receipt and signature received. Saving as %s and %s\n" % (receiptFile, sigFile))
+        receiptBytes = eval(msgObj.Receipt)
+        sigBytes = eval(msgObj.ReceiptSignature)
+        with open(receiptFile, "wb") as f:
+            f.write(receiptBytes)
+        with open(sigFile, "wb") as f:
+            f.write(sigBytes)
+        if not self.__bankClient.verify(receiptBytes, sigBytes):
+            responseTxt = "Received a receipt with mismatching signature\n"
+            responseTxt += "Please report this to the bank administrator\n"
+            responseTxt += "Quitting\n"
+            self.transport.write(responseTxt)
+            self.quit()
+        else:
+            self.transport.write("Valid receipt received. Transaction complete.")
+            self.transport.write("\n")
+
+    async def __doDeposit(self, bpData):
+        try:
+            msgObj = await self.__bankClient.deposit(bpData)
+            self.__handleReceipt(msgObj)
         except Exception as e:
             print(traceback.format_exc())
+            self.__failed(e)
+            
+    async def __doAccountTransfer(self, dstAcct, amount, memo):
+        try:
+            msgObj = await self.__bankClient.transfer(dstAcct, amount, memo)
+            self.__handleReceipt(msgObj)
+        except Exception as e:
+            print(traceback.format_exc())
+            self.__failed(e)
 
-    def __createAccount(self, result):
-        self.transport.write("  Account created.")
-        self.transport.write("\n")
-        self.reset()
+    async def __doCreateAccount(self, accountName):
+        try:
+            msgObj = await self.__bankClient.adminCreateAccount(accountName)
+            self.transport.write("  Account created.")
+            self.transport.write("\n")
+        except Exception as e:
+            self.__failed(e)
+            
+    async def __doCreateUser(self, userName, password):
+        try:
+            msgObj = await self.__bankClient.adminCreateUser(userName, password)
+            self.transport.write("  User created.")
+            self.transport.write("\n")
+        except Exception as e:
+            self.__failed(e)
 
-    def __createUser(self, result):
-        self.transport.write("  User created.")
-        self.transport.write("\n")
-        self.reset()
+    async def __doChangePassword(self, userName, newPassword, oldPassword):
+        try:
+            msgObj = await self.__bankClient.changePassword(
+                newPassword, 
+                loginName=userName, 
+                oldPassword=oldPassword)
+            self.transport.write("  Password changed successfully.")
+            self.transport.write("\n")
+        except Exception as e:
+            self.__failed(e)
 
-    def __changePassword(self, result):
-        self.transport.write("  Password changed successfully.")
-        self.transport.write("\n")
-        self.reset()
+    async def __doChangeAccess(self, result):
+        try:
+            result = self.__bankClient.changeAccess(user, access, account)
+            self.transport.write("  Access changed successfully.")
+            self.transport.write("\n")
+        except Exception as e:
+            self.__failed(e)
 
-    def __changeAccess(self, result):
-        self.transport.write("  Access changed successfully.")
-        self.transport.write("\n")
-        self.reset()
-
-    def __exportLedgerResponse(self, msgObj):
-        filename = "ledger_%f" % time.time()
-        self.transport.write("  Exported ledger downloaded.\n")
-        self.transport.write("  Saving to file %s\n" % filename)
-        with open(filename,"w+") as file:
-            for line in msgObj.Lines:
-                file.write(line+"\n")
-        self.transport.write("  Done.\n")
-        self.reset()
+    async def __doExportLedgerResponse(self, msgObj):
+        try:
+            msgObj = await self.__bankClient.exportLedger(account)
+            filename = "ledger_%f" % time.time()
+            self.transport.write("  Exported ledger downloaded.\n")
+            self.transport.write("  Saving to file %s\n" % filename)
+            with open(filename,"w+") as file:
+                for line in msgObj.Lines:
+                    file.write(line+"\n")
+            self.transport.write("  Done.\n")
+        except Exception as e:
+            self.__failed(e)
 
     def __failed(self, e):
         self.transport.write("\033[91m  Operation failed. Reason: %s\033[0m\n" % str(e))
-        self.reset()
         return Exception(e)
 
     def handleError(self, message, reporter=None, stackHack=0):
@@ -661,7 +646,6 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         callLater(0, self.transport.close)
         #callLater(.1, self.__clientBase.disconnectFromPlaygroundServer)
         callLater(.1, lambda: self.higherProtocol() and self.higherProtocol().close)
-        return Deferred()
 
     def handleException(self, e, reporter=None, stackHack=0, fatal=False):
         debugPrint("CLI handleException")
@@ -670,61 +654,65 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         if fatal:
             self.quit()
 
-    def reset(self):
-        self.__d = None
-
     def connection_made(self, transport):
         print("connection_made")
         try:
             CLIShell.CLIShell.connection_made(self, transport)
-
-            loop = self.__asyncLoop
             debugPrint("CLI Making a client connection...")
-            coro = playground.getConnector(self.__bankClientFactory.stack).create_playground_connection(self.__bankClientFactory.buildProtocol, self.__bankAddr, self.__bankPort)
-            debugPrint("CLI Running client protocol coroutine...")
-            fut = asyncio.run_coroutine_threadsafe(coro, self.__asyncLoop)
-            fut.add_done_callback(self.__handleClientConnection)
+
+            asyncio.ensure_future(self.client_connection_loop())
             debugPrint("CLI connection_made done")
         except Exception as e:
             print(traceback.format_exc())
             self.transport.close()
-
-    def __handleClientConnection(self, fut):
-        debugPrint("CLI __handleClientConnection")
-        debugPrint("Future result:", fut.exception())
-        transport, protocol = fut.result()
-        debugPrint("Bank connected. Running startup routines with protocol %s" % protocol)
-        self.__bankConnected(protocol)
-        print("Admin CLI client Connected. Starting UI t:{}. p:{}".format(transport, protocol))
-
-    def __bankConnected(self, result):
+            
+    async def client_connection_loop(self):
+        debugPrint("Connecting to bank at {}://{}:{}".format(
+            self.__bankClientFactory.stack,
+            self.__bankAddr,
+            self.__bankPort
+        ))
+        transport, protocol = await playground.create_connection(
+            self.__bankClientFactory.buildProtocol,
+            self.__bankAddr,
+            self.__bankPort,
+            family=self.__bankClientFactory.stack
+        )
+        debugPrint("Connected. Logging in.")
+        
+        self.__bankClient = protocol
+        self.__bankClient._on_connection_lost.add_done_callback(lambda fut: self.quit())
+        
         try:
-            self.__bankClient = result
-            # self.__bankClient.setLocalErrorHandler(self)
-            self.__d = self.__bankClient.waitForConnection() # self.__bankClient.loginToServer()
-            self.__bankClient.waitForTermination().addCallback(lambda *args: self.quit())
-            self.__d.addCallback(self.__loginToServer)
-            self.__d.addErrback(self.__noLogin)
-            self.transport.write("Logging in to bank. Waiting for server\n")
-            return self.__d
-        except:
-            print(traceback.format_exc())
-            self.transport.close()
+            result = await self.__bankClient.loginToServer()
+        except Exception as e:
+            debugPrint("Login error. {}".format(e))
+            result = False
+            
+        if result:
+            self.__connected = True
+            self.__loadCommands()
+            self.transport.write("Logged in to bank\n")
+        else:
+            self.transport.write("Failed to login to bank: %s\n" % str(e))
+            self.transport.write("Quiting")
+            callLater(.1, self.quit)
 
     def line_received(self, line):
-        if self.__d:
+        if self.__cur_task and not self.__cur_task.done():
+            # currently have
             if line.strip().lower() == "__break__":
-                self.__d = None
+                self.__waiting_for_server = False
                 self.transport.write("Operation cancelled on client. Unknown server state.\n")
-            elif not self.__connected:
-                self.transport.write("Still waiting for bank to login. Retry command later.\n")
             else:
                 self.transport.write("Cannot execute [%s]. Waiting for previous command to complete\n"%line)
                 self.transport.write("Type: __break__ to return to shell (undefined behavior).\n")
             return (False, None)
+        if not self.__connected:
+            self.transport.write("Still waiting for bank to login. Retry command later.\n")
         try:
-            return self.lineReceivedImpl(line)
-            # return (True, self.__d)
+            result, self.__cur_task = self.lineReceivedImpl(line)
+            return (result, self.__cur_task)
         except Exception as e:
             self.handleException(e)
             return (False, None)
@@ -751,63 +739,40 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             user = arg1
             account = arg2
 
-        self.__d = self.__bankClient.currentAccess(user, account)
-        self.__d.addCallback(self.__curAccess)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doCurrentAccess(user, account))
         
     def __accessSet(self, writer, user, access, account=None):
         if access == "*":
             access = PasswordData.ACCOUNT_PRIVILEGES
         if access == "__none__":
             access = ''
-        self.__d = self.__bankClient.changeAccess(user, access, account)
-        self.__d.addCallback(self.__changeAccess)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doChangeAccess(user, access, account))
         
     def __listAccounts(self, writer, user=None):
         if user and not self.__admin:
             writer("Not in admin mode\n")
             return
-        self.__d = self.__bankClient.listAccounts(user)
-        self.__d.addCallback(self.__listAccountsResponse)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doListAccounts(user))
         
     def __listUsers(self, writer, account=None):
-        self.__d = self.__bankClient.listUsers(account)
-        self.__d.addCallback(self.__listUsersResponse)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doListUsers())
         
     def __accountCurrent(self, writer):
-        self.__d = self.__bankClient.currentAccount()
-        self.__d.addCallback(self.__currentAccount)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doCurrentAccount())
         
     def __accountSwitch(self, writer, switchToAccount):
         if switchToAccount == "__none__":
             switchToAccount = ''
-        self.__d = self.__bankClient.switchAccount(switchToAccount)
-        self.__d.addCallback(self.__switchAccount)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doSwitchAccount(switchToAccount))
         
     def __accountBalance(self, writer, all=False):
         if not all:
-            self.__d = self.__bankClient.getBalance()
-            self.__d.addCallback(self.__accountBalanceResponse)
-            self.__d.addErrback(self.__failed)
+            return asyncio.ensure_future(self.__doAccountBalance())
         else:
             if not self.__admin:
                 writer("Not in admin mode\n")
-                return
-            self.__d = self.__bankClient.adminGetBalances()
-            self.__d.addCallback(self.__balances)
-            self.__d.addErrback(self.__failed)
-        return self.__d
+                return None
+            return asyncio.ensure_future(self.__doAllBalances())
             
     def __accountDeposit(self, writer, bpFile):
         if not os.path.exists(bpFile):
@@ -815,10 +780,8 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
             return
         with open(bpFile,"rb") as f:
             bpData = f.read()
-            self.__d = self.__bankClient.deposit(bpData)
-            self.__d.addCallback(self.__receipt)
-            self.__d.addErrback(self.__failed)
-        return self.__d
+            return asyncio.ensure_future(self.__doDeposit(bpData))
+        return None
             
     def __accountWithdrawArgsHandler(self, writer, amountStr):
         try:
@@ -832,10 +795,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         return (amount,)
             
     def __accountWithdraw(self, writer, amount):
-        self.__d = self.__bankClient.withdraw(amount)
-        self.__d.addCallback(self.__withdrawl)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doWithdrawl(amount))
         
     def __accountTransferArgsHandler(self, writer, dst, amountStr, memo):
         try:
@@ -849,19 +809,13 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         return (dst, amount, memo)
         
     def __accountTransfer(self, writer, dstAcct, amount, memo):
-        self.__d = self.__bankClient.transfer(dstAcct, amount, memo)
-        self.__d.addCallback(self.__receipt)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doAccountTransfer(dstAcct, amount, memo))
         
     def __accountCreate(self, writer, accountName):
         if not self.__admin:
             writer("Not in admin mode\n")
             return
-        self.__d = self.__bankClient.adminCreateAccount(accountName)
-        self.__d.addCallback(self.__createAccount)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doCreateAccount(accountName))
         
     def __userCreate(self, writer, userName):
         if not self.__admin:
@@ -872,10 +826,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         if password != password2:
             self.transport.write("Mismatching passwords\n")
             return
-        self.__d = self.__bankClient.adminCreateUser(userName, password)
-        self.__d.addCallback(self.__createAccount)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doCreateUser(userName, password))
         
     def __userPasswd(self, writer, userName=None):
         if not userName:
@@ -891,19 +842,13 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         if password2 != password3:
             writer("Mismatching passwords\n")
             return
-        self.__d = self.__bankClient.changePassword(password2, loginName=userName, oldPassword=oldPassword)
-        self.__d.addCallback(self.__changePassword)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doChangePassword(userName, password2, oldPassword))
         
     def __exportLedger(self, writer, account=None):
         if not account and not self.__admin:
             writer("Not in admin mode.\n")
             return
-        self.__d = self.__bankClient.exportLedger(account)
-        self.__d.addCallback(self.__exportLedgerResponse)
-        self.__d.addErrback(self.__failed)
-        return self.__d
+        return asyncio.ensure_future(self.__doExportLedger(account))
         
     def __loadCommands(self):
         cscc = CLIShell.CLICommand

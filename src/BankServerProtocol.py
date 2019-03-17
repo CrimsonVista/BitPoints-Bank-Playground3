@@ -105,13 +105,16 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
     def sendPacket(self, packet):
         self.transport.write(packet.__serialize__())
         debugPrint("Sent", packet.DEFINITION_IDENTIFIER)
+        
+    def handlePacket(self, protocol, packet):
+        self.__logSecure("Received packet %s" % packet)
+        super().handlePacket(protocol, packet)
 
-    def data_received(self, packet):
+    def data_received(self, data):
         self.__lastActivity = time.time()
         debugPrint("server proto data_received")
-        self.__logSecure("Received packet %s" % packet)
         try:
-            self.handlePacket(None, packet)
+            self.handleData(None, data)
         except Exception as e:
             print(traceback.format_exc())
             
@@ -428,11 +431,18 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         if desiredAccount.startswith("__"):
             self.__logSecure("ATTEMPT TO ACCESS SPECIAL ACCOUNT %s" % desiredAccount)
             response = self.__createResponse(msgObj, RequestFailure)
+            response.RequestId = msgObj.RequestId
             response.ErrorMessage = "Could not switch accounts"
             return self.sendPacket(response)
             
         elif desiredAccount in self.ADMIN_ACCOUNTS:
             return self.__admin_handleSwitchAccount(protocol, msgObj)
+        elif desiredAccount not in self.__bank.getAccounts():
+            self.__logSecure("Attempt to access unknown account %s" % desiredAccount)
+            response = self.__createResponse(msgObj, RequestFailure)
+            response.RequestId = msgObj.RequestId
+            response.ErrorMessage = "No such account {}".format(desiredAccount)
+            return self.sendPacket(response)
             
         else:
             with self.__setCrossAccount(desiredAccount) as crossAccount:
