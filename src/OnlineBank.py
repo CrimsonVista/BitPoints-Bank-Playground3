@@ -755,7 +755,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         return asyncio.ensure_future(self.__doListAccounts(user))
         
     def __listUsers(self, writer, account=None):
-        return asyncio.ensure_future(self.__doListUsers())
+        return asyncio.ensure_future(self.__doListUsers(account))
         
     def __accountCurrent(self, writer):
         return asyncio.ensure_future(self.__doCurrentAccount())
