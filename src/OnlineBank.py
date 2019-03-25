@@ -610,15 +610,15 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         except Exception as e:
             self.__failed(e)
 
-    async def __doChangeAccess(self, result):
+    async def __doChangeAccess(self, user, access, account):
         try:
-            result = self.__bankClient.changeAccess(user, access, account)
+            result = await self.__bankClient.changeAccess(user, access, account)
             self.transport.write("  Access changed successfully.")
             self.transport.write("\n")
         except Exception as e:
             self.__failed(e)
 
-    async def __doExportLedgerResponse(self, msgObj):
+    async def __doExportLedgerResponse(self, account):
         try:
             msgObj = await self.__bankClient.exportLedger(account)
             filename = "ledger_%f" % time.time()
