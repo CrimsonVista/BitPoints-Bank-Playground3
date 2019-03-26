@@ -1561,7 +1561,10 @@ class OnlineBankInterface:
         passwd = getpass.getpass("Enter bank account password for {}: ".format(username))
 
         clientFactory = PlaygroundOnlineBankClient(cert, username, passwd)
-        clientFactory.stack = self._bankConfig["SERVER"].get("stack","default") # UGLY HACK TO FIX LATER
+        if "SERVER" not in self._bankConfig:
+            clientFactory.stack = "default"
+        else:
+            clientFactory.stack = self._bankConfig["SERVER"].get("stack","default") # UGLY HACK TO FIX LATER
 
         loop = asyncio.get_event_loop()
 
