@@ -19,6 +19,7 @@ from BankMessages import *
 from Exchange import BitPoint
 
 from BankCore import LedgerOperationSuccess, Ledger, LedgerLine # For unshelving
+from OnlineBankConfig import OnlineBankConfig
 
 from BankServerProtocol import BankServerProtocol
 from PrintingPress import PrintingPress, DefaultSerializer
@@ -1201,9 +1202,8 @@ class OnlineBankInterface:
     def __init__(self):
         self.init_argument_handling()
         playgroundPath = Configure.CurrentPath()
-        self._bankconfigPath = os.path.join(playgroundPath, "bank")
-        if not os.path.exists(self._bankconfigPath):
-            os.mkdir(self._bankconfigPath)
+        self._bankconfig = OnlineBankConfig()
+        self._bankconfigPath = self._bankconfig.path()
         
         self._pwfile = os.path.join(self._bankconfigPath, "login_data.db")
         self._bankPath = os.path.join(self._bankconfigPath, "bankdata")
@@ -1263,7 +1263,7 @@ class OnlineBankInterface:
         
     def initialize_bank(self, args):
         if not os.path.exists(self._bankconfigPath):
-            os.mkdir(self._bankconfigPath)
+            raise Exception("Inconsistant state. Directory deleted after start")
         if args.initialize_cmd == "client":
             shutil.copy2(args.bank_cert, self._certPath)
         elif args.initialize_cmd == "mint":
@@ -1508,12 +1508,12 @@ class OnlineBankInterface:
         sys.exit("Finished.")
         
     def handle_server(self):
-        if "SERVER" not in self._bankConfig:
+        if not self._bankConfig.has_section("SERVER"):
             raise Exception("Server has not yet been configured.")
         required_config = "port",
         for k in required_config:
-            if k not in self._bankConfig["SERVER"]:
-                raise Exception("Client not yet configured. Requires {}".format(k))
+            if not self._bankConfig["SERVER"].has_key("SERVER",k):
+                raise Exception("Sever not yet configured. Requires {}".format(k))
                 
         enableSecurityLogging(self._bankPath)
         logSecure("Security Logging Enabled, creating bank server from path %s" % self._bankPath)
@@ -1528,8 +1528,8 @@ class OnlineBankInterface:
             if not result.succeeded():
                 sys.exit("Could not load mint certificate", result.msg())
                 
-        bankPort = int(self._bankConfig["SERVER"]["port"])
-        stack = self._bankConfig["SERVER"].get("stack","default")
+        bankPort = int(self._bankConfig.get_parameter("SERVER","port"))
+        stack = self._bankConfig.get_parameter("SERVER","stack","default")
 
         loop = asyncio.get_event_loop()
         loop.set_debug(enabled=True)
@@ -1544,24 +1544,24 @@ class OnlineBankInterface:
         loop.close()
         
     def handle_client(self):
-        if "CLIENT" not in self._bankConfig:
+        if not self._bankConfig.has_section("CLIENT"):
             raise Exception("Client has not yet been configured.")
         required_config = "bank_addr", "bank_port", "username"
         for k in required_config:
-            if k not in self._bankConfig["CLIENT"]:
+            if not self._bankConfig.has_key("CLIENT",k):
                 raise Exception("Client not yet configured. Requires {}".format(k))
         
-        bank_addr =     self._bankConfig["CLIENT"]["bank_addr"]
-        bank_port = int(self._bankConfig["CLIENT"]["bank_port"])
-        stack     =     self._bankConfig["CLIENT"].get("stack","default")
-        username  =     self._bankConfig["CLIENT"]["username"]
+        bank_addr =     self._bankConfig.get_parameter("CLIENT", "bank_addr")
+        bank_port = int(self._bankConfig.get_parameter("CLIENT", "bank_port"))
+        stack     =     self._bankConfig.get_parameter("CLIENT", "stack","default")
+        username  =     self._bankConfig.get_parameter("CLIENT", "username")
         
         
         cert = loadCertFromFile(self._certPath)
         passwd = getpass.getpass("Enter bank account password for {}: ".format(username))
 
         clientFactory = PlaygroundOnlineBankClient(cert, username, passwd)
-        clientFactory.stack = self._bankConfig["SERVER"].get("stack","default") # UGLY HACK TO FIX LATER
+        clientFactory.stack = self._bankConfig.get_parameter("SERVER","stack","default") # UGLY HACK TO FIX LATER
 
         loop = asyncio.get_event_loop()
 
@@ -1575,53 +1575,16 @@ class OnlineBankInterface:
         loop.call_soon(initShell)
         loop.run_forever()
             
-    def reloadConfig(self):
-        
-        bankconfigFile = os.path.join(self._bankconfigPath, "config.ini")
-        self._bankConfig = configparser.ConfigParser()
-        self._bankConfig.read(bankconfigFile)
-        
-    def saveConfig(self):
-        bankconfigFile = os.path.join(self._bankconfigPath, "config.ini")
-        with open(bankconfigFile, 'w') as configfile:
-            self._bankConfig.write(configfile)
-        
     def handle_config(self, args):
-        self.reloadConfig()
         section,param = args.setting.split(":")
         section = section.upper()
         
-        if section == "SERVER":
-        
-            if section not in self._bankConfig:
-                self._bankConfig[section] = {}
+        # error checking
+        if section,param = "SERVER","port":
+            port, args.setting_args
+            int(port) # throws an exception if not an int
             
-            if param == "port":
-                port, = args.setting_args
-                int(port)
-                self._bankConfig[section][param] = port
-                
-            elif param == "stack":
-                self._bankConfig[section][param] = port
-                
-            else:
-                print("Unknown settiong {}".format(args.setting))
-                
-        elif section == "CLIENT":
-            if section not in self._bankConfig:
-                self._bankConfig[section] = {}
-                
-            if param in ["username", "bank_addr", "bank_stack"]:
-                value, = args.setting_args
-                self._bankConfig[section][param] = value
-            elif param == "bank_port":
-                port, = args.setting_args
-                int(port)
-                self._bankConfig[section][param] = port
-                
-            else:
-                print("Unknown settiong {}".format(args.setting))
-        self.saveConfig()
+        
             
         
     def handle(self, args):
