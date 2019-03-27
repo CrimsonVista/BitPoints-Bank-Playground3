@@ -214,7 +214,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
 
         msgObj = msg
         if msgObj.ClientNonce != self.__connData["ClientNonce"]:
-            return d.errback(Exception("Invalid Connection Data"))
+            raise Exception("Invalid Connection Data")
         self.__connData["ServerNonce"] = msgObj.ServerNonce
         self.__account = msgObj.Account
         self.__state = self.STATE_OPEN
@@ -241,15 +241,15 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         debugPrint("client __validateStdSessionResponse", type(msgObj))
         if not msgObj.RequestId in self.__openRequests:
             debugPrint("No matching request ID.")
-            d.errback(Exception("Invalid internal state. No open request %d" % msgObj.RequestId))
+            #d.errback(Exception("Invalid internal state. No open request %d" % msgObj.RequestId))
             return False
         if msgObj.ClientNonce != self.__connData["ClientNonce"]:
             debugPrint("Got ClientNonce:", msgObj.ClientNonce, "Expected ClientNonce:", self.__connData["ClientNonce"])
-            d.errback(Exception("Invalid Connection Data (ClientNonce)"))
+            #d.errback(Exception("Invalid Connection Data (ClientNonce)"))
             return False
         if msgObj.ServerNonce != self.__connData["ServerNonce"]:
             debugPrint("Got ServerNonce:", msgObj.ServerNonce, "Expected ServerNonce:", self.__connData["ServerNonce"])
-            d.errback(Exception("Invalid Connection Data (ServerNonce"))
+            #d.errback(Exception("Invalid Connection Data (ServerNonce"))
             return False
         return True
 
@@ -393,7 +393,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         else: changeMsg.oldPwHash = ""
         changeMsg.newPwHash = PasswordHash(newPassword)
         changeMsg.NewUser = False
-        return await self.sendPacket(changeMsg)
+        return await self.sendPacketAwaitResponse(changeMsg)
 
     async def changeAccess(self, username, access, account=None):
         if self.state() != self.STATE_OPEN:
@@ -403,7 +403,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         changeMsg.AccessString = access
         if account:
             changeMsg.Account = account
-        return await self.sendPacket(changeMsg)
+        return await self.sendPacketAwaitResponse(changeMsg)
 
     async def exportLedger(self, account):
         if self.state() != self.STATE_OPEN:
@@ -611,15 +611,15 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         except Exception as e:
             self.__failed(e)
 
-    async def __doChangeAccess(self, result):
+    async def __doChangeAccess(self, user, access, account):
         try:
-            result = self.__bankClient.changeAccess(user, access, account)
+            result = await self.__bankClient.changeAccess(user, access, account)
             self.transport.write("  Access changed successfully.")
             self.transport.write("\n")
         except Exception as e:
             self.__failed(e)
 
-    async def __doExportLedgerResponse(self, msgObj):
+    async def __doExportLedgerResponse(self, account):
         try:
             msgObj = await self.__bankClient.exportLedger(account)
             filename = "ledger_%f" % time.time()
@@ -756,7 +756,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         return asyncio.ensure_future(self.__doListAccounts(user))
         
     def __listUsers(self, writer, account=None):
-        return asyncio.ensure_future(self.__doListUsers())
+        return asyncio.ensure_future(self.__doListUsers(account))
         
     def __accountCurrent(self, writer):
         return asyncio.ensure_future(self.__doCurrentAccount())
