@@ -262,7 +262,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         passwordHash = self.__pwDb.currentUserPassword(msgObj.Login)
         # debugPrint(passwordHash, len(passwordHash), type(passwordHash), "VS", msgObj.PasswordHash, len(msgObj.PasswordHash), type(msgObj.PasswordHash))
         
-        if passwordHash != eval(msgObj.PasswordHash):
+        if passwordHash != msgObj.PasswordHash:
             debugPrint("server proto __handleOpenSession pw not equal")
             return self.__error("Invalid Login. User does not exist or password is wrong")
         return True
@@ -524,7 +524,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         account = self.__getCurrentAccount()
         
         bps = []
-        bpData = eval(msgObj.bpData)
+        bpData = msgObj.bpData
         # debugPrint(bpData[:15], "...", bpData[-15:], len(bpData), type(bpData))
         while bpData:
             newBitPoint, offset = BitPoint.deserialize(bpData)
@@ -589,7 +589,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
         return True
         
     def __createSetUserPasswordResponse(self, msgObj, userName):
-        pwHash = eval(msgObj.newPwHash)
+        pwHash = msgObj.newPwHash
         self.__pwDb.createUser(userName, pwHash, modify=True)
         self.__pwDb.sync()
         self.__logSecure("Password changed")
@@ -621,7 +621,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             errorResponse.ErrorMessage = "No password hash specified"
             return self.sendPacket(errorResponse)
             
-        elif self.__pwDb.currentUserPassword(userName) != eval(msgObj.oldPwHash):
+        elif self.__pwDb.currentUserPassword(userName) != msgObj.oldPwHash:
             self.__logSecure("Incorrect previous password for %s password change" % userName)
             errorResponse.ErrorMessage = "Invalid Password"
             return self.sendPacket(errorResponse)

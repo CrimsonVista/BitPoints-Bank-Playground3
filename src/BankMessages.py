@@ -4,7 +4,7 @@ Created on Apr 1, 2014
 @author: sethjn
 '''
 from playground.network.packet import PacketType
-from playground.network.packet.fieldtypes import BOOL, INT16, INT64, UINT16, UINT64, STRING, ListFieldType as LIST
+from playground.network.packet.fieldtypes import BOOL, INT16, INT64, UINT16, UINT64, STRING, BUFFER, ListFieldType as LIST
 from playground.network.packet.fieldtypes.attributes import Optional
 
 class OpenSession(PacketType):
@@ -13,7 +13,7 @@ class OpenSession(PacketType):
     FIELDS = [
             ("ClientNonce", UINT64),
             ("Login",STRING),
-            ("PasswordHash",STRING)
+            ("PasswordHash",BUFFER)
             ]
 
 class SessionOpen(PacketType):
@@ -152,7 +152,7 @@ class DepositRequest(PacketType):
             ("ClientNonce",UINT64),
             ("ServerNonce",UINT64),
             ("RequestId",UINT64),
-            ("bpData",STRING)
+            ("bpData",BUFFER)
             ]
 
 class WithdrawalRequest(PacketType):
@@ -172,7 +172,7 @@ class WithdrawalResponse(PacketType):
             ("ClientNonce",UINT64),
             ("ServerNonce",UINT64),
             ("RequestId",UINT64),
-            ("bpData",STRING)
+            ("bpData",BUFFER)
             ]
 
 class SetUserPasswordRequest(PacketType):
@@ -183,8 +183,8 @@ class SetUserPasswordRequest(PacketType):
             ("ServerNonce",UINT64),
             ("RequestId",UINT64),
             ("loginName", STRING),
-            ("oldPwHash", STRING),
-            ("newPwHash", STRING),
+            ("oldPwHash", BUFFER),
+            ("newPwHash", BUFFER),
             ("NewUser", BOOL)
             ]
 
@@ -248,8 +248,8 @@ class Receipt(PacketType):
             ("ClientNonce",UINT64),
             ("ServerNonce",UINT64),
             ("RequestId",UINT64),
-            ("Receipt", STRING),
-            ("ReceiptSignature", STRING)
+            ("Receipt", BUFFER),
+            ("ReceiptSignature", BUFFER)
             ]
 
 class LedgerRequest(PacketType):
@@ -268,7 +268,7 @@ class LedgerResponse(PacketType):
             ("ClientNonce",UINT64),
             ("ServerNonce",UINT64),
             ("RequestId",UINT64),
-            ("Lines",LIST(STRING))]
+            ("Lines",LIST(BUFFER))]
 
 class LoginFailure(PacketType):
     DEFINITION_IDENTIFIER = "apps.bank.LoginFailure"

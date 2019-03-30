@@ -540,7 +540,7 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         try:
             msgObj = await self.__bankClient.withdraw(amount)
             debugPrint("client __withdrawl")
-            result = eval(msgObj.bpData)
+            result = msgObj.bpData
             filename = "bp"+str(time.time())
             open(filename,"wb").write(result)
             self.transport.write("  Withdrew bitpoints into file %s" % filename)
@@ -552,8 +552,8 @@ class AdminBankCLIClient(CLIShell.CLIShell, ErrorHandler):
         receiptFile = "bank_receipt."+str(time.time())
         sigFile = receiptFile + ".signature"
         self.transport.write("Receipt and signature received. Saving as %s and %s\n" % (receiptFile, sigFile))
-        receiptBytes = eval(msgObj.Receipt)
-        sigBytes = eval(msgObj.ReceiptSignature)
+        receiptBytes = msgObj.Receipt
+        sigBytes = msgObj.ReceiptSignature
         with open(receiptFile, "wb") as f:
             f.write(receiptBytes)
         with open(sigFile, "wb") as f:
@@ -1508,11 +1508,11 @@ class OnlineBankInterface:
         sys.exit("Finished.")
         
     def handle_server(self):
-        if not self._bankConfig.has_section("SERVER"):
+        if not self._bankconfig.has_section("SERVER"):
             raise Exception("Server has not yet been configured.")
         required_config = "port",
         for k in required_config:
-            if not self._bankConfig["SERVER"].has_key("SERVER",k):
+            if not self._bankconfig.has_key("SERVER",k):
                 raise Exception("Sever not yet configured. Requires {}".format(k))
                 
         enableSecurityLogging(self._bankPath)
@@ -1528,8 +1528,8 @@ class OnlineBankInterface:
             if not result.succeeded():
                 sys.exit("Could not load mint certificate", result.msg())
                 
-        bankPort = int(self._bankConfig.get_parameter("SERVER","port"))
-        stack = self._bankConfig.get_parameter("SERVER","stack","default")
+        bankPort = int(self._bankconfig.get_parameter("SERVER","port"))
+        stack = self._bankconfig.get_parameter("SERVER","stack","default")
 
         loop = asyncio.get_event_loop()
         loop.set_debug(enabled=True)
@@ -1544,24 +1544,24 @@ class OnlineBankInterface:
         loop.close()
         
     def handle_client(self):
-        if not self._bankConfig.has_section("CLIENT"):
+        if not self._bankconfig.has_section("CLIENT"):
             raise Exception("Client has not yet been configured.")
         required_config = "bank_addr", "bank_port", "username"
         for k in required_config:
-            if not self._bankConfig.has_key("CLIENT",k):
+            if not self._bankconfig.has_key("CLIENT",k):
                 raise Exception("Client not yet configured. Requires {}".format(k))
         
-        bank_addr =     self._bankConfig.get_parameter("CLIENT", "bank_addr")
-        bank_port = int(self._bankConfig.get_parameter("CLIENT", "bank_port"))
-        stack     =     self._bankConfig.get_parameter("CLIENT", "stack","default")
-        username  =     self._bankConfig.get_parameter("CLIENT", "username")
+        bank_addr =     self._bankconfig.get_parameter("CLIENT", "bank_addr")
+        bank_port = int(self._bankconfig.get_parameter("CLIENT", "bank_port"))
+        stack     =     self._bankconfig.get_parameter("CLIENT", "stack","default")
+        username  =     self._bankconfig.get_parameter("CLIENT", "username")
         
         
         cert = loadCertFromFile(self._certPath)
         passwd = getpass.getpass("Enter bank account password for {}: ".format(username))
 
         clientFactory = PlaygroundOnlineBankClient(cert, username, passwd)
-        clientFactory.stack = self._bankConfig.get_parameter("SERVER","stack","default") # UGLY HACK TO FIX LATER
+        clientFactory.stack = self._bankconfig.get_parameter("SERVER","stack","default") # UGLY HACK TO FIX LATER
 
         loop = asyncio.get_event_loop()
 
@@ -1580,11 +1580,12 @@ class OnlineBankInterface:
         section = section.upper()
         
         # error checking
-        if section,param = "SERVER","port":
-            port, args.setting_args
+        if (section,param) == ("SERVER","port"):
+            port, = args.setting_args
             int(port) # throws an exception if not an int
             
-        
+        self._bankconfig.set_parameter(section,param,args.setting_args[0])
+        # TODO. what to do about multiple args?
             
         
     def handle(self, args):
@@ -1595,7 +1596,7 @@ class OnlineBankInterface:
         if args.cmd == "initialize":
             self.initialize_bank(args)
             
-        self.reloadConfig()
+        self._bankconfig.reloadConfig()
     
         if args.cmd == "config":
             self.handle_config(args)
@@ -1615,15 +1616,18 @@ class OnlineBankInterface:
                   verifier.verify(receiptData, receiptSigData))
 
         elif args.cmd == "server":
+            # no permanent changes to config after this point
+            self._bankconfig = self._bankconfig.create_view()
             self.handle_server()
 
         elif args.cmd == "client":
+            # no permanent changes to config after this point
+            self._bankconfig = self._bankconfig.create_view()
+            
             overrides = {}
             if args.override:
-                if "CLIENT" not in self._bankConfig:
-                    self._bankConfig["CLIENT"] = {}
                 for key, value in args.override:
-                    self._bankConfig["CLIENT"][key] = value
+                    self._bankconfig.set_parameter("CLIENT",key,value)
             self.handle_client()
 
 if __name__ == "__main__":
