@@ -369,7 +369,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
             raise Exception("Cannot login. State: %s" % self.__state)
         createMsg = self.__createStdSessionRequest(SetUserPasswordRequest)
         createMsg.loginName = loginName
-        createMsg.oldPwHash = ''
+        createMsg.oldPwHash = b''
         createMsg.newPwHash = PasswordHash(password)
         createMsg.NewUser = True
         return await self.sendPacketAwaitResponse(createMsg)
