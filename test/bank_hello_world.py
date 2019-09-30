@@ -42,7 +42,8 @@ async def example_transfer(bank_client, src, dst, amount, memo):
     except Exception as e:
         print("Could not transfer because {}".format(e))
         return False
-        
+    
+    bank_client.close()
     return result
     
 def example_verify(bank_client, receipt_bytes, signature_bytes, dst, amount, memo):
