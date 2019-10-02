@@ -390,7 +390,7 @@ class BankClientProtocol(SimplePacketHandler, StackingProtocol):
         else: changeMsg.loginName = ""
         if oldPassword:
             changeMsg.oldPwHash = PasswordHash(oldPassword)
-        else: changeMsg.oldPwHash = ""
+        else: changeMsg.oldPwHash = b""
         changeMsg.newPwHash = PasswordHash(newPassword)
         changeMsg.NewUser = False
         return await self.sendPacketAwaitResponse(changeMsg)
