@@ -119,6 +119,7 @@ class BankServerProtocol(StackingProtocol, SimplePacketHandler, ErrorHandler):
             print(traceback.format_exc())
             
     def __checkTimeout(self):
+        if self.transport.is_closing(): return
         idle_time = time.time() - self.__lastActivity
         
         debugPrint("Check timeout. Idle {} seconds.".format(idle_time))
